@@ -64,6 +64,12 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact: true,
     },
     Keybinding {
+        keys: "/",
+        description: "filter visible tasks as you type",
+        section: Section::Tasks,
+        compact: true,
+    },
+    Keybinding {
         keys: "Space / d",
         description: "complete or reopen the selected task",
         section: Section::Tasks,

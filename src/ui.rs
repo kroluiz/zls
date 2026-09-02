@@ -41,6 +41,7 @@ enum Mode {
     Move,
     Help,
     Configuration,
+    TaskSearch,
     Search,
     Project,
     Transition,
@@ -86,6 +87,7 @@ struct State {
     config_path: String,
     task_path: String,
     jira_config: Option<JiraConfig>,
+    task_query: String,
 }
 
 impl Default for State {
@@ -118,6 +120,7 @@ impl Default for State {
             config_path: String::new(),
             task_path: String::new(),
             jira_config: None,
+            task_query: String::new(),
         }
     }
 }
@@ -164,7 +167,12 @@ fn run_loop(
 
     loop {
         handle_jira_events(&mut state, &receiver, &sender, jira.as_ref());
-        let entries = entries(store, state.show_history, state.show_backlog);
+        let entries = entries(
+            store,
+            state.show_history,
+            state.show_backlog,
+            &state.task_query,
+        );
         state.selected = state.selected.min(entries.len().saturating_sub(1));
         request_selected_card(&entries, &mut state, jira.as_ref(), &sender);
 
@@ -193,6 +201,7 @@ fn run_loop(
             Mode::Move => handle_move_key(key.code, &entries, &mut state, store)?,
             Mode::Help => handle_help_key(key.code, &mut state),
             Mode::Configuration => handle_configuration_key(key.code, &mut state),
+            Mode::TaskSearch => handle_task_search_key(key.code, &mut state),
             Mode::Search => handle_search_key(key.code, &mut state, store, jira.as_ref(), &sender)?,
             Mode::Project => {
                 handle_project_key(key.code, &mut state, &mut jira)?;
@@ -231,12 +240,21 @@ fn handle_normal_key(
     sender: &Sender<JiraEvent>,
 ) -> Result<bool> {
     match key {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Esc if !state.task_query.is_empty() => {
+            state.task_query.clear();
+            state.selected = 0;
+        }
+        KeyCode::Esc => return Ok(true),
         KeyCode::Char('?') => {
             state.mode = Mode::Help;
             state.help_scroll = 0;
         }
         KeyCode::Char('g') => state.mode = Mode::Configuration,
+        KeyCode::Char('/') => {
+            state.mode = Mode::TaskSearch;
+            state.selected = 0;
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
             state.card_scroll = 0;
@@ -442,6 +460,26 @@ fn handle_configuration_key(key: KeyCode, state: &mut State) {
     }
 }
 
+fn handle_task_search_key(key: KeyCode, state: &mut State) {
+    match key {
+        KeyCode::Enter => state.mode = Mode::Normal,
+        KeyCode::Esc => {
+            state.task_query.clear();
+            state.selected = 0;
+            state.mode = Mode::Normal;
+        }
+        KeyCode::Backspace => {
+            state.task_query.pop();
+            state.selected = 0;
+        }
+        KeyCode::Char(character) => {
+            state.task_query.push(character);
+            state.selected = 0;
+        }
+        _ => {}
+    }
+}
+
 fn handle_search_key(
     key: KeyCode,
     state: &mut State,
@@ -460,7 +498,12 @@ fn handle_search_key(
                 (state.search_selected + 1).min(state.search_results.len().saturating_sub(1));
         }
         KeyCode::Enter if !state.search_results.is_empty() => {
-            let entries = entries(store, state.show_history, state.show_backlog);
+            let entries = entries(
+                store,
+                state.show_history,
+                state.show_backlog,
+                &state.task_query,
+            );
             if let Some(entry) = entries.get(state.selected) {
                 let issue = &state.search_results[state.search_selected];
                 store.link_jira(&entry.task.id, &issue.key)?;
@@ -794,8 +837,8 @@ fn handle_jira_events(
     }
 }
 
-fn entries(store: &Store, show_history: bool, show_backlog: bool) -> Vec<Entry> {
-    if show_history {
+fn entries(store: &Store, show_history: bool, show_backlog: bool, query: &str) -> Vec<Entry> {
+    let entries = if show_history {
         let all = store.entries_all().into_iter().collect::<Vec<_>>();
         let mut entries = all
             .iter()
@@ -812,7 +855,24 @@ fn entries(store: &Store, show_history: bool, show_backlog: bool) -> Vec<Entry> 
             entries.extend(store.entries_backlog());
         }
         entries
-    }
+    };
+    entries
+        .into_iter()
+        .filter(|entry| task_matches(entry, query))
+        .collect()
+}
+
+fn task_matches(entry: &Entry, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || entry.task.text.to_lowercase().contains(&query)
+        || entry.task.id.to_lowercase().contains(&query)
+        || entry.date.to_lowercase().contains(&query)
+        || entry
+            .task
+            .jira
+            .as_ref()
+            .is_some_and(|key| key.to_lowercase().contains(&query))
 }
 
 fn draw(
@@ -856,6 +916,11 @@ fn draw(
         Mode::Move => draw_move_selector(frame, state),
         Mode::Help => draw_help(frame, state),
         Mode::Configuration => draw_configuration(frame, state, jira_error),
+        Mode::TaskSearch => draw_single_input(
+            frame,
+            "Search tasks / Enter keep / Esc clear",
+            &state.task_query,
+        ),
         Mode::Search => draw_search(frame, state),
         Mode::Project => draw_project_selector(frame, state),
         Mode::Transition => draw_transition_selector(frame, state),
@@ -866,11 +931,14 @@ fn draw(
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &State) {
-    let title = if state.show_history {
+    let mut title = if state.show_history {
         "ZLS / HISTORY".to_owned()
     } else {
         format!("ZLS / TODAY / {}", today())
     };
+    if !state.task_query.is_empty() {
+        title.push_str(&format!(" / SEARCH: {}", state.task_query));
+    }
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(title, Style::default().add_modifier(Modifier::BOLD)),
@@ -897,6 +965,12 @@ fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
     let backlog_selected =
         selected_id.and_then(|id| backlog.iter().position(|entry| entry.task.id == id));
 
+    let empty_message = if state.task_query.is_empty() {
+        "Nothing here. Press a to add a task.".to_owned()
+    } else {
+        format!("No tasks match /{}", state.task_query)
+    };
+
     if state.show_backlog {
         let backlog_height = (backlog.len() as u16 + 2)
             .max(3)
@@ -911,7 +985,11 @@ fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
             &regular,
             regular_selected,
             " TASKS ",
-            "Nothing scheduled for today.",
+            if state.task_query.is_empty() {
+                "Nothing scheduled for today."
+            } else {
+                &empty_message
+            },
             state.show_history,
         );
         draw_task_list(
@@ -920,7 +998,11 @@ fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
             &backlog,
             backlog_selected,
             " BACKLOG ",
-            "Backlog is empty. Press B to add.",
+            if state.task_query.is_empty() {
+                "Backlog is empty. Press B to add."
+            } else {
+                &empty_message
+            },
             false,
         );
     } else {
@@ -930,7 +1012,7 @@ fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
             &regular,
             regular_selected,
             " TASKS ",
-            "Nothing here. Press a to add a task.",
+            &empty_message,
             state.show_history,
         );
     }
@@ -1201,7 +1283,7 @@ fn append_text<'a>(lines: &mut Vec<Line<'a>>, text: &'a str, fallback: &'a str) 
 }
 
 fn draw_single_input(frame: &mut Frame, title: &str, input: &str) {
-    let area = centered(frame.area(), 70, 3);
+    let area = centered_fixed(frame.area(), 70, 3);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(input).block(Block::default().borders(Borders::ALL).title(title)),
@@ -1516,4 +1598,30 @@ fn centered_fixed(area: Rect, width_percent: u16, height: u16) -> Rect {
         width,
         height,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Task;
+
+    #[test]
+    fn task_search_matches_all_visible_identifiers_case_insensitively() {
+        let entry = Entry {
+            date: "2026-09-02".to_owned(),
+            task: Task {
+                id: "a1B2c3D4".to_owned(),
+                text: "Prepare Smart Factory presentation".to_owned(),
+                completed: false,
+                done: None,
+                jira: Some("MP-396".to_owned()),
+            },
+        };
+
+        assert!(task_matches(&entry, "smart factory"));
+        assert!(task_matches(&entry, "mp-396"));
+        assert!(task_matches(&entry, "A1b2"));
+        assert!(task_matches(&entry, "09-02"));
+        assert!(!task_matches(&entry, "unrelated"));
+    }
 }
