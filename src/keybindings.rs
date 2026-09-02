@@ -2,6 +2,7 @@
 pub enum Section {
     Tasks,
     Jira,
+    Configuration,
     Navigation,
     Dialogs,
 }
@@ -11,6 +12,7 @@ impl Section {
         match self {
             Self::Tasks => "TASKS",
             Self::Jira => "JIRA",
+            Self::Configuration => "CONFIGURATION",
             Self::Navigation => "NAVIGATION",
             Self::Dialogs => "DIALOGS AND EDITORS",
         }
@@ -146,6 +148,12 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact: false,
     },
     Keybinding {
+        keys: "g",
+        description: "show the loaded ZLS configuration",
+        section: Section::Configuration,
+        compact: false,
+    },
+    Keybinding {
         keys: "Enter",
         description: "select or apply; insert a newline while editing comments",
         section: Section::Dialogs,
@@ -208,6 +216,7 @@ mod tests {
         for section in [
             Section::Tasks,
             Section::Jira,
+            Section::Configuration,
             Section::Navigation,
             Section::Dialogs,
         ] {

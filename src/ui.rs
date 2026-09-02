@@ -26,8 +26,8 @@ use ratatui::{
 
 use crate::{
     jira::{
-        IssueCard, IssueSummary, JiraClient, JiraComment, ProjectSummary, Transition,
-        format_jira_datetime,
+        IssueCard, IssueSummary, JiraClient, JiraComment, JiraConfig, ProjectSummary, Transition,
+        config_path, format_jira_datetime,
     },
     keybindings::{KEYBINDINGS, Section, compact_hint},
     store::{BACKLOG, Entry, Store, today, tomorrow},
@@ -39,6 +39,7 @@ enum Mode {
     AddBacklog,
     Move,
     Help,
+    Configuration,
     Search,
     Project,
     Transition,
@@ -81,6 +82,9 @@ struct State {
     transition_loading: bool,
     move_selected: usize,
     help_scroll: u16,
+    config_path: String,
+    task_path: String,
+    jira_config: Option<JiraConfig>,
 }
 
 impl Default for State {
@@ -110,6 +114,9 @@ impl Default for State {
             transition_loading: false,
             move_selected: 0,
             help_scroll: 0,
+            config_path: String::new(),
+            task_path: String::new(),
+            jira_config: None,
         }
     }
 }
@@ -137,7 +144,15 @@ fn run_loop(
         Err(error) => (None, Some(error.to_string())),
     };
     let (sender, receiver) = mpsc::channel();
-    let mut state = State::default();
+    let mut state = State {
+        config_path: config_path()?.display().to_string(),
+        task_path: store.path().display().to_string(),
+        jira_config: jira
+            .as_ref()
+            .map(|client| client.config().clone())
+            .or_else(|| JiraConfig::load().ok()),
+        ..State::default()
+    };
     let carried = store.carry()?;
     if carried > 0 {
         state.message = format!(
@@ -176,6 +191,7 @@ fn run_loop(
             Mode::AddBacklog => handle_add_key(key.code, &mut state, store, true)?,
             Mode::Move => handle_move_key(key.code, &entries, &mut state, store)?,
             Mode::Help => handle_help_key(key.code, &mut state),
+            Mode::Configuration => handle_configuration_key(key.code, &mut state),
             Mode::Search => handle_search_key(key.code, &mut state, store, jira.as_ref(), &sender)?,
             Mode::Project => {
                 handle_project_key(key.code, &mut state, &mut jira)?;
@@ -219,6 +235,7 @@ fn handle_normal_key(
             state.mode = Mode::Help;
             state.help_scroll = 0;
         }
+        KeyCode::Char('g') => state.mode = Mode::Configuration,
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
             state.card_scroll = 0;
@@ -418,6 +435,12 @@ fn handle_help_key(key: KeyCode, state: &mut State) {
     }
 }
 
+fn handle_configuration_key(key: KeyCode, state: &mut State) {
+    if matches!(key, KeyCode::Char('g' | 'q') | KeyCode::Esc) {
+        state.mode = Mode::Normal;
+    }
+}
+
 fn handle_search_key(
     key: KeyCode,
     state: &mut State,
@@ -488,6 +511,7 @@ fn handle_project_key(
             let project = &state.project_results[state.project_selected];
             if let Some(client) = jira.as_mut() {
                 client.set_project(&project.key)?;
+                state.jira_config = Some(client.config().clone());
                 state.message = format!("Jira project set to {} ({})", project.key, project.name);
                 state.mode = Mode::Normal;
                 state.search_results.clear();
@@ -830,6 +854,7 @@ fn draw(
         Mode::AddBacklog => draw_single_input(frame, "New backlog task", &state.input),
         Mode::Move => draw_move_selector(frame, state),
         Mode::Help => draw_help(frame, state),
+        Mode::Configuration => draw_configuration(frame, state, jira_error),
         Mode::Search => draw_search(frame, state),
         Mode::Project => draw_project_selector(frame, state),
         Mode::Transition => draw_transition_selector(frame, state),
@@ -1266,6 +1291,7 @@ fn draw_help(frame: &mut Frame, state: &State) {
     for section in [
         Section::Tasks,
         Section::Jira,
+        Section::Configuration,
         Section::Navigation,
         Section::Dialogs,
     ] {
@@ -1298,6 +1324,52 @@ fn draw_help(frame: &mut Frame, state: &State) {
             .scroll((state.help_scroll, 0)),
         inner,
     );
+}
+
+fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>) {
+    let area = centered(frame.area(), 70, 62);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" CONFIGURATION / g, q, or Esc close ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![
+        section_separator("ZLS", inner.width),
+        detail_line("Config file", &state.config_path),
+        detail_line("Tasks file", &state.task_path),
+        Line::raw(""),
+        section_separator("JIRA", inner.width),
+    ];
+    if let Some(config) = state.jira_config.as_ref() {
+        lines.extend([
+            detail_line("Site", &config.site),
+            detail_line("Email", &config.email),
+            detail_line("Cloud ID", &config.cloud_id),
+            detail_line(
+                "Project",
+                config.project.as_deref().unwrap_or("Not selected"),
+            ),
+            detail_line(
+                "Auth",
+                if jira_error.is_none() {
+                    "Available"
+                } else {
+                    "Credential unavailable"
+                },
+            ),
+            detail_line("API token", "Hidden"),
+        ]);
+        if let Some(error) = jira_error {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(error, Style::default().fg(Color::Yellow)));
+        }
+    } else {
+        lines.push(Line::raw("Jira is not configured."));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_project_selector(frame: &mut Frame, state: &State) {

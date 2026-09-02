@@ -32,6 +32,8 @@ Reload tmux with `tmux source-file ~/.tmux.conf`, then press prefix followed by 
 
 Press `?` in the popup to see every keybinding. The compact header and help overlay are generated from the same registry in `src/keybindings.rs`, which is the authoritative place for keybinding descriptions.
 
+Press `g` to inspect the configuration currently loaded by ZLS, including the config and task-file paths, Jira site, account, Cloud ID, project, and credential availability. API tokens are never displayed.
+
 The Jira card opens on the right for the selected linked task. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Press `s` to select the one Jira project ZLS will use; the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
 
 When the popup opens, unfinished tasks from previous days are automatically carried into today. Completed tasks remain under their original date in history. The operation is idempotent, so reopening the popup does not duplicate or rewrite already-carried tasks.
