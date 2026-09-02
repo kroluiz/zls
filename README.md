@@ -12,6 +12,14 @@ make
 
 The release executable is created at `target/release/zls`.
 
+Install it system-wide as `/usr/bin/zls`:
+
+```console
+sudo make install
+```
+
+Use `make install-user` instead to install through Cargo for the current user. `PREFIX`, `BINDIR`, and `DESTDIR` are supported for packaged or staged installations.
+
 ## Tmux setup
 
 Add this key binding to `~/.tmux.conf`:
@@ -132,4 +140,5 @@ make test
 make lint
 make check
 make install
+make install-user
 ```

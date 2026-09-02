@@ -1,4 +1,7 @@
-.PHONY: all build check clean fmt install lint popup run test
+.PHONY: all build check clean fmt install install-user lint popup run test
+
+PREFIX ?= /usr
+BINDIR ?= $(PREFIX)/bin
 
 all: build
 
@@ -24,7 +27,10 @@ run:
 popup: build
 	./target/release/zls popup
 
-install:
+install: build
+	install -Dm755 target/release/zls "$(DESTDIR)$(BINDIR)/zls"
+
+install-user:
 	cargo install --path .
 
 clean:
