@@ -23,6 +23,8 @@ pub struct Task {
     pub done: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jira: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +69,7 @@ fn new_task(text: &str) -> Task {
         completed: false,
         done: None,
         jira: None,
+        doc: None,
     }
 }
 
@@ -148,6 +151,7 @@ impl Store {
                 completed: captures[1].eq_ignore_ascii_case("x"),
                 done: value("done").map(str::to_owned),
                 jira: value("jira").map(str::to_owned),
+                doc: value("doc").map(str::to_owned),
             });
         }
     }
@@ -332,6 +336,27 @@ impl Store {
         Ok(result)
     }
 
+    pub fn entry(&self, reference: &str, today_only_for_number: bool) -> Result<Entry> {
+        let (section_index, task_index) = self.find(reference, today_only_for_number)?;
+        Ok(Entry {
+            date: self.sections[section_index].date.clone(),
+            task: self.sections[section_index].tasks[task_index].clone(),
+        })
+    }
+
+    pub fn link_document(&mut self, reference: &str, link: &str) -> Result<Task> {
+        let path = Path::new(link);
+        if link.trim().is_empty() || path.file_name().is_none_or(|name| name != path.as_os_str()) {
+            bail!("invalid task documentation link: {link}");
+        }
+        let (section_index, task_index) = self.find(reference, false)?;
+        let task = &mut self.sections[section_index].tasks[task_index];
+        task.doc = Some(link.to_owned());
+        let result = task.clone();
+        self.save()?;
+        Ok(result)
+    }
+
     pub fn set_completed(
         &mut self,
         reference: &str,
@@ -492,8 +517,12 @@ impl Store {
                     .jira
                     .as_ref()
                     .map_or_else(String::new, |key| format!(" jira:{key}"));
+                let doc = task
+                    .doc
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(" doc:{path}"));
                 output.push_str(&format!(
-                    "- [{state}] {} <!-- id:{}{jira}{done} -->\n",
+                    "- [{state}] {} <!-- id:{}{jira}{doc}{done} -->\n",
                     task.text, task.id,
                 ));
             }
@@ -629,6 +658,25 @@ mod tests {
             Some("OBS-482")
         );
         assert!(fs::read_to_string(path)?.contains("jira:OBS-482"));
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_links_round_trip_in_markdown() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("todo.md");
+        let mut store = Store::load(path.clone())?;
+        let task = store.add("document this task")?;
+
+        store.link_document(&task.id, "task-notes.md")?;
+
+        let loaded = Store::load(path.clone())?;
+        assert_eq!(
+            loaded.entries_today()[0].task.doc.as_deref(),
+            Some("task-notes.md")
+        );
+        assert!(fs::read_to_string(path)?.contains("doc:task-notes.md"));
+        assert!(store.link_document(&task.id, "../outside.md").is_err());
         Ok(())
     }
 

@@ -1,17 +1,20 @@
 mod config;
+mod docs;
 mod jira;
 mod keybindings;
 mod store;
 mod ui;
 
 use std::{
-    env,
+    env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
 use config::AppConfig;
 use store::{Entry, Store, today};
@@ -54,6 +57,20 @@ enum Action {
     Status,
     /// Move a task to today, tomorrow, backlog, or a date
     Move { task: String, destination: String },
+    /// Create, edit, or read task documentation
+    Docs {
+        #[command(subcommand)]
+        command: DocsAction,
+    },
+    /// Emit task and documentation context for AI tools
+    Context {
+        task: String,
+        #[arg(long, value_enum, default_value_t = ContextFormat::Json)]
+        format: ContextFormat,
+        /// Include current Jira issue details, excluding comments
+        #[arg(long)]
+        jira: bool,
+    },
     /// Manage tasks without a scheduled day
     Backlog {
         #[command(subcommand)]
@@ -80,6 +97,22 @@ enum BacklogAction {
 }
 
 #[derive(Subcommand)]
+enum DocsAction {
+    /// Open task documentation in VISUAL or EDITOR
+    Edit { task: String },
+    /// Print task documentation
+    Show { task: String },
+    /// Print the path to existing task documentation
+    Path { task: String },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ContextFormat {
+    Json,
+    Markdown,
+}
+
+#[derive(Subcommand)]
 enum JiraAction {
     /// Configure Jira Cloud credentials
     Auth,
@@ -98,7 +131,16 @@ enum JiraAction {
     /// Display a Jira issue card
     Show { key: String },
     /// Post a Jira comment
-    Comment { key: String, text: String },
+    Comment {
+        key: String,
+        text: Option<String>,
+        /// Read the comment body from a file; use - for stdin
+        #[arg(long, visible_alias = "from-file", conflicts_with_all = ["text", "stdin"])]
+        body_file: Option<PathBuf>,
+        /// Read the comment body from stdin
+        #[arg(long, conflicts_with_all = ["text", "body_file"])]
+        stdin: bool,
+    },
     /// List valid status transitions for a Jira issue
     Transitions { key: String },
     /// Apply a Jira status transition by ID
@@ -158,16 +200,94 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[derive(Serialize)]
+struct TaskContext {
+    task: Entry,
+    documentation: Option<String>,
+    jira: Option<jira::IssueCard>,
+}
+
+fn ensure_task_document(store: &mut Store, entry: &Entry, docs_path: &Path) -> Result<PathBuf> {
+    let jira_config = jira::JiraConfig::load().ok();
+    let (path, link) = docs::ensure_document(docs_path, entry, jira_config.as_ref())?;
+    if entry.task.doc.is_none() {
+        store.link_document(&entry.task.id, &link)?;
+    }
+    Ok(path)
+}
+
+fn read_comment_input(
+    text: Option<String>,
+    body_file: Option<PathBuf>,
+    stdin: bool,
+) -> Result<String> {
+    let body = match (text, body_file, stdin) {
+        (Some(text), None, false) => text,
+        (None, Some(path), false) if path == Path::new("-") => {
+            let mut body = String::new();
+            io::stdin().read_to_string(&mut body)?;
+            body
+        }
+        (None, Some(path), false) => {
+            let path = expand_home(path);
+            fs::read_to_string(&path)
+                .with_context(|| format!("failed to read Jira comment from {}", path.display()))?
+        }
+        (None, None, true) => {
+            let mut body = String::new();
+            io::stdin().read_to_string(&mut body)?;
+            body
+        }
+        _ => bail!("provide comment text, --body-file, or --stdin exactly once"),
+    };
+    if body.trim().is_empty() {
+        bail!("Jira comment must not be empty");
+    }
+    Ok(body)
+}
+
+fn print_task_context(context: &TaskContext, format: ContextFormat) -> Result<()> {
+    match format {
+        ContextFormat::Json => println!("{}", serde_json::to_string_pretty(context)?),
+        ContextFormat::Markdown => {
+            println!("# Task Context\n");
+            println!("- ID: {}", context.task.task.id);
+            println!("- Title: {}", context.task.task.text);
+            println!("- Date: {}", context.task.date);
+            println!("- Completed: {}", context.task.task.completed);
+            if let Some(key) = context.task.task.jira.as_deref() {
+                println!("- Jira: {key}");
+            }
+            println!("\n## Documentation\n");
+            println!(
+                "{}",
+                context
+                    .documentation
+                    .as_deref()
+                    .unwrap_or("Not documented.")
+            );
+            if let Some(issue) = context.jira.as_ref() {
+                println!("\n## Jira Issue\n");
+                println!("```json");
+                println!("{}", serde_json::to_string_pretty(issue)?);
+                println!("```");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load_or_create(initial_task_file()?)?;
+    let docs_path = expand_home(config.docs.path.clone());
     let file = cli
         .file
         .or_else(|| env::var_os("ZLS_FILE").map(PathBuf::from))
         .unwrap_or(config.tasks.path);
     let mut store = Store::load(expand_home(file))?;
     match cli.command.unwrap_or(Action::Ui) {
-        Action::Ui => ui::run(&mut store),
+        Action::Ui => ui::run(&mut store, &docs_path),
         Action::Popup => {
             if env::var_os("TMUX").is_none() {
                 bail!("popup must be run inside tmux");
@@ -249,6 +369,53 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+        Action::Docs { command } => match command {
+            DocsAction::Edit { task } => {
+                let entry = store.entry(&task, true)?;
+                let path = ensure_task_document(&mut store, &entry, &docs_path)?;
+                docs::edit_document(&path)
+            }
+            DocsAction::Show { task } => {
+                let entry = store.entry(&task, true)?;
+                let documentation =
+                    docs::read_document(&docs_path, &entry.task)?.ok_or_else(|| {
+                        anyhow::anyhow!("task has no documentation; run `zls docs edit {task}`")
+                    })?;
+                print!("{documentation}");
+                Ok(())
+            }
+            DocsAction::Path { task } => {
+                let entry = store.entry(&task, true)?;
+                let path =
+                    docs::linked_document_path(&docs_path, &entry.task)?.ok_or_else(|| {
+                        anyhow::anyhow!("task has no documentation; run `zls docs edit {task}`")
+                    })?;
+                println!("{}", path.display());
+                Ok(())
+            }
+        },
+        Action::Context { task, format, jira } => {
+            let entry = store.entry(&task, true)?;
+            let documentation = docs::read_document(&docs_path, &entry.task)?;
+            let issue = if jira {
+                let key = entry
+                    .task
+                    .jira
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("task is not linked to Jira"))?;
+                Some(jira::JiraClient::from_config()?.issue_context(key)?)
+            } else {
+                None
+            };
+            print_task_context(
+                &TaskContext {
+                    task: entry,
+                    documentation,
+                    jira: issue,
+                },
+                format,
+            )
+        }
         Action::Backlog { command } => match command {
             BacklogAction::List { json } => print_entries(&store.entries_backlog(), json),
             BacklogAction::Add { text } => {
@@ -315,7 +482,13 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&card)?);
                 Ok(())
             }
-            JiraAction::Comment { key, text } => {
+            JiraAction::Comment {
+                key,
+                text,
+                body_file,
+                stdin,
+            } => {
+                let text = read_comment_input(text, body_file, stdin)?;
                 let comment = jira::JiraClient::from_config()?.post_comment(&key, &text)?;
                 println!("{}", serde_json::to_string_pretty(&comment)?);
                 Ok(())
@@ -365,5 +538,29 @@ fn main() -> ExitCode {
             eprintln!("zls: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_jira_comment_from_text_or_file() -> Result<()> {
+        assert_eq!(
+            read_comment_input(Some("direct comment".to_owned()), None, false)?,
+            "direct comment"
+        );
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("comment.md");
+        fs::write(&path, "multiline\ncomment\n")?;
+        assert_eq!(
+            read_comment_input(None, Some(path), false)?,
+            "multiline\ncomment\n"
+        );
+        assert!(read_comment_input(None, None, false).is_err());
+        assert!(read_comment_input(Some("text".to_owned()), None, true).is_err());
+        Ok(())
     }
 }

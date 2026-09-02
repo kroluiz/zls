@@ -70,6 +70,12 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact: true,
     },
     Keybinding {
+        keys: "e",
+        description: "edit documentation for the selected task",
+        section: Section::Tasks,
+        compact: true,
+    },
+    Keybinding {
         keys: "Space / d",
         description: "complete or reopen the selected task",
         section: Section::Tasks,

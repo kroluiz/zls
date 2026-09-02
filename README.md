@@ -7,9 +7,12 @@ ZLS stores its task-file path in `~/.config/zls/config.toml`. On first run, it k
 ```toml
 [tasks]
 path = "/home/luiz/Documents/notes/appoena/todo.md"
+
+[docs]
+path = "/home/luiz/.local/share/zls/docs"
 ```
 
-Edit that path to move the task store. `ZLS_FILE` and `--file` remain available as temporary overrides.
+Edit these paths to move the task store or documentation directory. `ZLS_FILE` and `--file` remain available as temporary task-file overrides.
 
 ## Build
 
@@ -42,6 +45,8 @@ Press `?` in the popup to see every keybinding. The compact header and help over
 Press `g` to inspect the configuration currently loaded by ZLS, including the config and task-file paths, Jira site, account, Cloud ID, project, and credential availability. API tokens are never displayed.
 
 Press `/` to filter visible tasks in real time by text, Jira key, date, or task ID. `Enter` keeps the filtered view so task actions apply to those results; `Esc` clears the filter.
+
+Press `e` to create or edit documentation for the selected task in `$VISUAL`, falling back to `$EDITOR`. ZLS temporarily leaves the TUI while the editor is open, then restores it. Documented tasks display a `[doc]` marker.
 
 The Jira card opens on the right for the selected linked task. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Press `s` to select the one Jira project ZLS will use; the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
 
@@ -81,6 +86,24 @@ Backlog CLI operations are also available:
 ```
 
 Use `today --json` or `history --json` for scripts and AI tools. Tasks can be changed by displayed number or stable ID.
+
+## Task documentation
+
+Each task can own one Markdown document under the configured `[docs] path`. The document is created lazily as `<task-id>.md`, linked explicitly from the task metadata, and never rewritten by ZLS after creation.
+
+```console
+./target/release/zls docs edit 1
+./target/release/zls docs show TASK_ID
+./target/release/zls docs path TASK_ID
+```
+
+For AI tools, `context` emits JSON containing the local task, its complete documentation, and its Jira correlation. Use `--format markdown` for readable output or `--jira` to fetch current issue details without comments. The default command makes no network requests.
+
+```console
+./target/release/zls context TASK_ID
+./target/release/zls context TASK_ID --format markdown
+./target/release/zls context TASK_ID --jira > context.json
+```
 
 ## Jira Cloud
 
@@ -122,7 +145,11 @@ Jira CLI operations are also available:
 ./target/release/zls jira unlink 1
 ./target/release/zls jira import OBS-482
 ./target/release/zls jira comment OBS-482 "Investigation update"
+./target/release/zls jira comment OBS-482 --body-file jira-comment.md
+./target/release/zls jira comment OBS-482 --stdin < jira-comment.md
 ```
+
+Comment text, `--body-file`, and `--stdin` are mutually exclusive. Use `--body-file -` as another way to read the body from stdin.
 
 Issue cards include a structured Details section with creator, reporter, parent, labels, Sprint, issue type, components, fix versions, timestamps, status, priority, assignee, subtasks, issue links, and the five newest comments. Press `t` to open a dropdown containing only the status transitions Jira currently allows for that issue.
 

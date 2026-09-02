@@ -1,5 +1,6 @@
 use std::{
     io::{self, stdout},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -26,6 +27,7 @@ use ratatui::{
 
 use crate::{
     config::config_path,
+    docs,
     jira::{
         IssueCard, IssueSummary, JiraClient, JiraComment, JiraConfig, ProjectSummary, Transition,
         format_jira_datetime,
@@ -88,6 +90,8 @@ struct State {
     task_path: String,
     jira_config: Option<JiraConfig>,
     task_query: String,
+    docs_path: String,
+    edit_document: bool,
 }
 
 impl Default for State {
@@ -121,18 +125,20 @@ impl Default for State {
             task_path: String::new(),
             jira_config: None,
             task_query: String::new(),
+            docs_path: String::new(),
+            edit_document: false,
         }
     }
 }
 
-pub fn run(store: &mut Store) -> Result<()> {
+pub fn run(store: &mut Store, docs_path: &Path) -> Result<()> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, store);
+    let result = run_loop(&mut terminal, store, docs_path);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -142,6 +148,7 @@ pub fn run(store: &mut Store) -> Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     store: &mut Store,
+    docs_path: &Path,
 ) -> Result<()> {
     let (mut jira, jira_error) = match JiraClient::from_config() {
         Ok(client) => (Some(client), None),
@@ -151,6 +158,7 @@ fn run_loop(
     let mut state = State {
         config_path: config_path()?.display().to_string(),
         task_path: store.path().display().to_string(),
+        docs_path: docs_path.display().to_string(),
         jira_config: jira
             .as_ref()
             .map(|client| client.config().clone())
@@ -227,6 +235,10 @@ fn run_loop(
                 }
             }
         }
+        if state.edit_document {
+            state.edit_document = false;
+            edit_selected_document(terminal, &entries, &mut state, store, docs_path)?;
+        }
     }
 }
 
@@ -255,6 +267,7 @@ fn handle_normal_key(
             state.mode = Mode::TaskSearch;
             state.selected = 0;
         }
+        KeyCode::Char('e') if !entries.is_empty() => state.edit_document = true,
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
             state.card_scroll = 0;
@@ -683,6 +696,49 @@ fn request_selected_card(
     });
 }
 
+fn edit_selected_document(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    entries: &[Entry],
+    state: &mut State,
+    store: &mut Store,
+    docs_path: &Path,
+) -> Result<()> {
+    let Some(entry) = entries.get(state.selected) else {
+        state.message = "Select a task to document".to_owned();
+        return Ok(());
+    };
+    let prepared = (|| -> Result<_> {
+        let (path, link) = docs::ensure_document(docs_path, entry, state.jira_config.as_ref())?;
+        if entry.task.doc.is_none() {
+            store.link_document(&entry.task.id, &link)?;
+        }
+        Ok(path)
+    })();
+    let path = match prepared {
+        Ok(path) => path,
+        Err(error) => {
+            state.message = format!("Documentation error: {error:#}");
+            return Ok(());
+        }
+    };
+
+    disable_raw_mode()?;
+    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        let _ = enable_raw_mode();
+        return Err(error.into());
+    }
+    let _ = terminal.show_cursor();
+    let edit_result = docs::edit_document(&path);
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+    state.message = match edit_result {
+        Ok(()) => format!("Documentation saved for {}", entry.task.id),
+        Err(error) => format!("Documentation error: {error:#}"),
+    };
+    Ok(())
+}
+
 fn request_search(
     state: &mut State,
     client: &JiraClient,
@@ -1039,12 +1095,17 @@ fn draw_task_list(
                     .jira
                     .as_ref()
                     .map_or_else(String::new, |key| format!(" [{key}]"));
+                let docs = if entry.task.doc.is_some() {
+                    " [doc]"
+                } else {
+                    ""
+                };
                 let date = if show_dates {
                     format!("  {}", entry.date)
                 } else {
                     String::new()
                 };
-                ListItem::new(format!("[{checked}] {}{jira}{date}", entry.task.text))
+                ListItem::new(format!("[{checked}] {}{jira}{docs}{date}", entry.task.text))
             })
             .collect()
     };
@@ -1422,6 +1483,7 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
         section_separator("ZLS", inner.width),
         detail_line("Config file", &state.config_path),
         detail_line("Tasks file", &state.task_path),
+        detail_line("Docs path", &state.docs_path),
         Line::raw(""),
         section_separator("JIRA", inner.width),
     ];
@@ -1615,6 +1677,7 @@ mod tests {
                 completed: false,
                 done: None,
                 jira: Some("MP-396".to_owned()),
+                doc: None,
             },
         };
 

@@ -298,6 +298,22 @@ impl JiraClient {
         }
     }
 
+    pub fn issue_context(&self, key: &str) -> Result<IssueCard> {
+        let key = validate_issue_key(key)?;
+        match self.fetch_issue(key, "*all,-comment") {
+            Ok(issue) => Ok(issue.into_card(Vec::new())),
+            Err(network_error) => {
+                let mut cached = self.read_cache(key).with_context(|| {
+                    format!("failed to fetch {key} and no cached issue card is available")
+                })?;
+                cached.comments.clear();
+                cached.stale = true;
+                cached.stale_reason = Some(format!("Jira request failed: {network_error:#}"));
+                Ok(cached)
+            }
+        }
+    }
+
     pub fn post_comment(&self, key: &str, text: &str) -> Result<JiraComment> {
         let key = validate_issue_key(key)?;
         if text.is_empty() {
@@ -376,11 +392,17 @@ impl JiraClient {
     }
 
     fn fetch_issue_card(&self, key: &str) -> Result<IssueCard> {
+        Ok(self
+            .fetch_issue(key, "*all")?
+            .into_card(self.issue_comments(key, 5)?))
+    }
+
+    fn fetch_issue(&self, key: &str, fields: &str) -> Result<ApiIssue> {
         let issue: ApiIssue = self
             .authenticated(
                 self.http
                     .get(self.api_url(&format!("/rest/api/3/issue/{key}")))
-                    .query(&[("fields", "*all"), ("expand", "names")]),
+                    .query(&[("fields", fields), ("expand", "names")]),
             )
             .send()
             .context("failed to fetch Jira issue")?
@@ -388,7 +410,7 @@ impl JiraClient {
             .context("Jira issue fetch failed")?
             .json()
             .context("invalid issue response from Jira")?;
-        Ok(issue.into_card(self.issue_comments(key, 5)?))
+        Ok(issue)
     }
 
     fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
