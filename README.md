@@ -2,7 +2,14 @@
 
 A popup-first daily task list written in Rust and backed by Markdown.
 
-By default ZLS uses the `todo.md` file in this project's parent directory. Override it with `ZLS_FILE` or `--file`.
+ZLS stores its task-file path in `~/.config/zls/config.toml`. On first run, it keeps using an existing project-level `todo.md`; otherwise it defaults to `~/.local/share/zls/todo.md`.
+
+```toml
+[tasks]
+path = "/home/luiz/Documents/notes/appoena/todo.md"
+```
+
+Edit that path to move the task store. `ZLS_FILE` and `--file` remain available as temporary overrides.
 
 ## Build
 
@@ -132,7 +139,7 @@ To show a compact reminder in the tmux status bar:
 
 ```tmux
 set-option -g status-interval 30
-set-option -ag status-right ' #(ZLS_FILE=/home/luiz/Documents/notes/appoena/todo.md /home/luiz/Documents/notes/appoena/zls/target/release/zls status)'
+set-option -ag status-right ' #(/home/luiz/Documents/notes/appoena/zls/target/release/zls status)'
 ```
 
 ## Development

@@ -25,9 +25,10 @@ use ratatui::{
 };
 
 use crate::{
+    config::config_path,
     jira::{
         IssueCard, IssueSummary, JiraClient, JiraComment, JiraConfig, ProjectSummary, Transition,
-        config_path, format_jira_datetime,
+        format_jira_datetime,
     },
     keybindings::{KEYBINDINGS, Section, compact_hint},
     store::{BACKLOG, Entry, Store, today, tomorrow},

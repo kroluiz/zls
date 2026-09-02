@@ -1,3 +1,4 @@
+mod config;
 mod jira;
 mod keybindings;
 mod store;
@@ -12,13 +13,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+use config::AppConfig;
 use store::{Entry, Store, today};
 
 #[derive(Parser)]
 #[command(about = "A popup-first, Markdown-backed daily task list")]
 struct Cli {
-    #[arg(long, global = true, default_value_os_t = default_file())]
-    file: PathBuf,
+    /// Temporarily override the configured task file
+    #[arg(long, global = true)]
+    file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -108,16 +111,16 @@ enum JiraAction {
     Import { key: String },
 }
 
-fn default_file() -> PathBuf {
-    env::var_os("ZLS_FILE").map_or_else(
-        || {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("the project has a parent directory")
-                .join("todo.md")
-        },
-        PathBuf::from,
-    )
+fn initial_task_file() -> Result<PathBuf> {
+    let legacy = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the project has a parent directory")
+        .join("todo.md");
+    if legacy.exists() {
+        Ok(legacy)
+    } else {
+        config::default_data_path()
+    }
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -157,7 +160,12 @@ fn shell_quote(value: &str) -> String {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut store = Store::load(expand_home(cli.file))?;
+    let config = AppConfig::load_or_create(initial_task_file()?)?;
+    let file = cli
+        .file
+        .or_else(|| env::var_os("ZLS_FILE").map(PathBuf::from))
+        .unwrap_or(config.tasks.path);
+    let mut store = Store::load(expand_home(file))?;
     match cli.command.unwrap_or(Action::Ui) {
         Action::Ui => ui::run(&mut store),
         Action::Popup => {

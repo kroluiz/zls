@@ -12,6 +12,8 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::config::config_path;
+
 const TOKEN_ENV: &str = "ZLS_JIRA_TOKEN";
 const KEYRING_SERVICE: &str = "zls";
 
@@ -504,10 +506,6 @@ pub fn format_jira_datetime(input: &str) -> String {
                 .to_string()
         })
         .unwrap_or_else(|_| input.to_owned())
-}
-
-pub fn config_path() -> Result<PathBuf> {
-    xdg_path("XDG_CONFIG_HOME", ".config").map(|path| path.join("zls/config.toml"))
 }
 
 pub fn cache_dir() -> Result<PathBuf> {
