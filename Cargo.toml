@@ -1,0 +1,21 @@
+[package]
+name = "zls"
+version = "0.1.0"
+edition = "2024"
+description = "A popup-first, Markdown-backed daily task list"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
