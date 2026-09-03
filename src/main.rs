@@ -13,11 +13,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::NaiveDate;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use config::AppConfig;
-use store::{Entry, Store, today};
+use store::{Entry, Store, WeekReport, today};
 
 #[derive(Parser)]
 #[command(about = "A popup-first, Markdown-backed daily task list")]
@@ -57,6 +58,14 @@ enum Action {
     Status,
     /// Move a task to today, tomorrow, backlog, or a date
     Move { task: String, destination: String },
+    /// Show completed tasks for an ISO week
+    Week {
+        /// Select the current week (0), previous week (1), and so on
+        #[arg(long, default_value_t = 0)]
+        weeks_ago: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Create, edit, or read task documentation
     Docs {
         #[command(subcommand)]
@@ -191,6 +200,61 @@ fn print_entries(entries: &[Entry], as_json: bool) -> Result<()> {
                 entry.date,
                 entry.task.id
             );
+        }
+    }
+    Ok(())
+}
+
+fn print_week_report(report: &WeekReport, as_json: bool) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "ISO WEEK {}-W{:02} / {} to {}",
+        report.iso_year, report.iso_week, report.start, report.end
+    );
+    println!(
+        "{} completed / {} Jira-linked\n",
+        report.completed, report.jira_linked
+    );
+    for day in &report.days {
+        let title = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
+            .map(|date| date.format("%A / %Y-%m-%d").to_string())
+            .unwrap_or_else(|_| day.date.clone());
+        println!("{title}");
+        if day.tasks.is_empty() {
+            println!("  No completed tasks.");
+        }
+        for entry in &day.tasks {
+            let jira = entry
+                .task
+                .jira
+                .as_ref()
+                .map_or_else(String::new, |key| format!(" [{key}]"));
+            let docs = if entry.task.doc.is_some() {
+                " [doc]"
+            } else {
+                ""
+            };
+            println!("  [x] {}{jira}{docs}", entry.task.text);
+        }
+        println!();
+    }
+    if !report.undated.is_empty() {
+        println!("Undated");
+        for entry in &report.undated {
+            let jira = entry
+                .task
+                .jira
+                .as_ref()
+                .map_or_else(String::new, |key| format!(" [{key}]"));
+            let docs = if entry.task.doc.is_some() {
+                " [doc]"
+            } else {
+                ""
+            };
+            println!("  [x] {}{jira}{docs}", entry.task.text);
         }
     }
     Ok(())
@@ -368,6 +432,9 @@ fn run() -> Result<()> {
                 serde_json::to_string(&store.move_task(&task, &destination, true)?)?
             );
             Ok(())
+        }
+        Action::Week { weeks_ago, json } => {
+            print_week_report(&store.week_report_weeks_ago(weeks_ago)?, json)
         }
         Action::Docs { command } => match command {
             DocsAction::Edit { task } => {

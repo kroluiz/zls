@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, NaiveDate, SecondsFormat};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, SecondsFormat, Weekday};
 use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -38,6 +38,34 @@ pub struct Entry {
     pub date: String,
     #[serde(flatten)]
     pub task: Task,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WeekDay {
+    pub date: String,
+    pub tasks: Vec<Entry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WeekReport {
+    pub iso_year: i32,
+    pub iso_week: u32,
+    pub start: String,
+    pub end: String,
+    pub completed: usize,
+    pub jira_linked: usize,
+    pub days: Vec<WeekDay>,
+    pub undated: Vec<Entry>,
+}
+
+impl WeekReport {
+    pub fn entries(&self) -> Vec<Entry> {
+        self.days
+            .iter()
+            .flat_map(|day| day.tasks.iter().cloned())
+            .chain(self.undated.iter().cloned())
+            .collect()
+    }
 }
 
 pub struct Store {
@@ -238,6 +266,82 @@ impl Store {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn week_report_weeks_ago(&self, weeks_ago: u32) -> Result<WeekReport> {
+        let current = Local::now().date_naive();
+        let current_monday =
+            current - Duration::days(i64::from(current.weekday().num_days_from_monday()));
+        let start = current_monday
+            .checked_sub_signed(Duration::weeks(i64::from(weeks_ago)))
+            .ok_or_else(|| {
+                anyhow::anyhow!("weeks-ago value is outside the supported date range")
+            })?;
+        self.week_report(start.iso_week().year(), start.iso_week().week())
+    }
+
+    pub fn week_report(&self, iso_year: i32, iso_week: u32) -> Result<WeekReport> {
+        let start = NaiveDate::from_isoywd_opt(iso_year, iso_week, Weekday::Mon)
+            .ok_or_else(|| anyhow::anyhow!("invalid ISO week {iso_year}-W{iso_week:02}"))?;
+        let end = start
+            .checked_add_signed(Duration::days(6))
+            .ok_or_else(|| anyhow::anyhow!("ISO week end is outside the supported date range"))?;
+        let mut days = (0..7)
+            .map(|offset| WeekDay {
+                date: (start + Duration::days(offset)).to_string(),
+                tasks: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut undated = Vec::new();
+
+        for entry in self
+            .entries_all()
+            .into_iter()
+            .filter(|entry| entry.task.completed)
+        {
+            let completed_date = entry
+                .task
+                .done
+                .as_deref()
+                .and_then(|done| DateTime::parse_from_rfc3339(done).ok())
+                .map(|done| done.date_naive());
+            if let Some(date) = completed_date.filter(|date| *date >= start && *date <= end) {
+                days[(date - start).num_days() as usize].tasks.push(entry);
+            } else if completed_date.is_none()
+                && NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d")
+                    .is_ok_and(|date| date >= start && date <= end)
+            {
+                undated.push(entry);
+            }
+        }
+
+        for day in &mut days {
+            day.tasks.sort_by_key(|entry| {
+                entry
+                    .task
+                    .done
+                    .as_deref()
+                    .and_then(|done| DateTime::parse_from_rfc3339(done).ok())
+                    .map(|done| done.timestamp())
+            });
+        }
+        let completed = days.iter().map(|day| day.tasks.len()).sum::<usize>() + undated.len();
+        let jira_linked = days
+            .iter()
+            .flat_map(|day| &day.tasks)
+            .chain(&undated)
+            .filter(|entry| entry.task.jira.is_some())
+            .count();
+        Ok(WeekReport {
+            iso_year,
+            iso_week,
+            start: start.to_string(),
+            end: end.to_string(),
+            completed,
+            jira_linked,
+            days,
+            undated,
+        })
     }
 
     pub fn add(&mut self, text: &str) -> Result<Task> {
@@ -677,6 +781,34 @@ mod tests {
         );
         assert!(fs::read_to_string(path)?.contains("doc:task-notes.md"));
         assert!(store.link_document(&task.id, "../outside.md").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn weekly_report_groups_by_completion_time_and_keeps_undated_tasks() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("todo.md");
+        fs::write(
+            &path,
+            "# ZLS Tasks\n\n## 2026-08-20\n\n- [x] finished Tuesday <!-- id:tue jira:MP-1 done:2026-09-01T00:30:00+14:00 -->\n\n## 2026-09-02\n\n- [x] old completion <!-- id:old done:2026-08-20T10:00:00-03:00 -->\n- [x] missing timestamp <!-- id:undated -->\n- [ ] still open <!-- id:open -->\n",
+        )?;
+        let store = Store::load(path)?;
+
+        let report = store.week_report(2026, 36)?;
+
+        assert_eq!(report.start, "2026-08-31");
+        assert_eq!(report.end, "2026-09-06");
+        assert_eq!(report.completed, 2);
+        assert_eq!(report.jira_linked, 1);
+        assert_eq!(report.days.len(), 7);
+        assert_eq!(report.days[1].tasks[0].task.id, "tue");
+        assert_eq!(report.undated[0].task.id, "undated");
+        assert_eq!(report.entries().len(), 2);
+        assert!(store.week_report_weeks_ago(u32::MAX).is_err());
+
+        let year_boundary = store.week_report(2025, 1)?;
+        assert_eq!(year_boundary.start, "2024-12-30");
+        assert_eq!(year_boundary.end, "2025-01-05");
         Ok(())
     }
 

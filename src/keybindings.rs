@@ -88,6 +88,12 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact: false,
     },
     Keybinding {
+        keys: "W",
+        description: "open the weekly completion retrospective",
+        section: Section::Tasks,
+        compact: false,
+    },
+    Keybinding {
         keys: "B",
         description: "add a task directly to backlog",
         section: Section::Tasks,

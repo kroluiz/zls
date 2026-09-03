@@ -48,6 +48,8 @@ Press `/` to filter visible tasks in real time by text, Jira key, date, or task 
 
 Press `e` to create or edit documentation for the selected task in `$VISUAL`, falling back to `$EDITOR`. ZLS temporarily leaves the TUI while the editor is open, then restores it. Documented tasks display a `[doc]` marker.
 
+Press `W` for the weekly retrospective. It groups completed tasks by their completion timestamp across the current ISO week. Use `Left` and `Right` to move through current and previous weeks, `0` to return to the current week, and `Esc` to return to the task list. Tasks remain selectable for Jira inspection and documentation editing.
+
 The Jira card opens on the right for the selected linked task. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Press `s` to select the one Jira project ZLS will use; the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
 
 When the popup opens, unfinished tasks from previous days are automatically carried into today. Completed tasks remain under their original date in history. The operation is idempotent, so reopening the popup does not duplicate or rewrite already-carried tasks.
@@ -83,9 +85,14 @@ Backlog CLI operations are also available:
 ./target/release/zls history
 ./target/release/zls carry
 ./target/release/zls status
+./target/release/zls week
+./target/release/zls week --weeks-ago 1
+./target/release/zls week --weeks-ago 1 --json
 ```
 
 Use `today --json` or `history --json` for scripts and AI tools. Tasks can be changed by displayed number or stable ID.
+
+Weekly reports always show Monday through Sunday, including days without completions. Completed tasks without a valid completion timestamp appear in an `Undated` section when their scheduled date belongs to that week. Reports include total completion and Jira-linked counts.
 
 ## Task documentation
 

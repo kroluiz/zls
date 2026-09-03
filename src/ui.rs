@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
+use chrono::NaiveDate;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -33,7 +34,7 @@ use crate::{
         format_jira_datetime,
     },
     keybindings::{KEYBINDINGS, Section, compact_hint},
-    store::{BACKLOG, Entry, Store, today, tomorrow},
+    store::{BACKLOG, Entry, Store, WeekReport, today, tomorrow},
 };
 
 enum Mode {
@@ -92,6 +93,8 @@ struct State {
     task_query: String,
     docs_path: String,
     edit_document: bool,
+    weekly: bool,
+    weeks_ago: u32,
 }
 
 impl Default for State {
@@ -127,6 +130,8 @@ impl Default for State {
             task_query: String::new(),
             docs_path: String::new(),
             edit_document: false,
+            weekly: false,
+            weeks_ago: 0,
         }
     }
 }
@@ -175,11 +180,20 @@ fn run_loop(
 
     loop {
         handle_jira_events(&mut state, &receiver, &sender, jira.as_ref());
-        let entries = entries(
-            store,
-            state.show_history,
-            state.show_backlog,
-            &state.task_query,
+        let week_report = state
+            .weekly
+            .then(|| store.week_report_weeks_ago(state.weeks_ago))
+            .transpose()?;
+        let entries = week_report.as_ref().map_or_else(
+            || {
+                entries(
+                    store,
+                    state.show_history,
+                    state.show_backlog,
+                    &state.task_query,
+                )
+            },
+            WeekReport::entries,
         );
         state.selected = state.selected.min(entries.len().saturating_sub(1));
         request_selected_card(&entries, &mut state, jira.as_ref(), &sender);
@@ -191,6 +205,7 @@ fn run_loop(
                 &state,
                 jira.as_ref(),
                 jira_error.as_deref(),
+                week_report.as_ref(),
             )
         })?;
         if !event::poll(Duration::from_millis(50))? {
@@ -220,6 +235,11 @@ fn run_loop(
             Mode::Comment => handle_comment_key(key.code, key.modifiers, &mut state),
             Mode::ConfirmComment => {
                 handle_confirmation_key(key.code, &mut state, jira.as_ref(), &sender)
+            }
+            Mode::Normal if state.weekly => {
+                if handle_week_key(key.code, &entries, &mut state)? {
+                    return Ok(());
+                }
             }
             Mode::Normal => {
                 if handle_normal_key(
@@ -263,6 +283,13 @@ fn handle_normal_key(
             state.help_scroll = 0;
         }
         KeyCode::Char('g') => state.mode = Mode::Configuration,
+        KeyCode::Char('W') => {
+            state.weekly = true;
+            state.weeks_ago = 0;
+            state.selected = 0;
+            state.jira_tab = false;
+            state.task_query.clear();
+        }
         KeyCode::Char('/') => {
             state.mode = Mode::TaskSearch;
             state.selected = 0;
@@ -385,6 +412,52 @@ fn handle_normal_key(
                 });
                 state.message = "Loading more comments...".to_owned();
             }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_week_key(key: KeyCode, entries: &[Entry], state: &mut State) -> Result<bool> {
+    match key {
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Esc | KeyCode::Char('W') => {
+            state.weekly = false;
+            state.selected = 0;
+            state.jira_tab = false;
+        }
+        KeyCode::Char('?') => {
+            state.mode = Mode::Help;
+            state.help_scroll = 0;
+        }
+        KeyCode::Left => {
+            state.weeks_ago = state.weeks_ago.saturating_add(1);
+            state.selected = 0;
+        }
+        KeyCode::Right => {
+            state.weeks_ago = state.weeks_ago.saturating_sub(1);
+            state.selected = 0;
+        }
+        KeyCode::Char('0') => {
+            state.weeks_ago = 0;
+            state.selected = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+            state.card_scroll = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.selected = (state.selected + 1).min(entries.len().saturating_sub(1));
+            state.card_scroll = 0;
+        }
+        KeyCode::Char('e') if !entries.is_empty() => state.edit_document = true,
+        KeyCode::Enter if !entries.is_empty() => state.jira_tab = true,
+        KeyCode::Tab => state.jira_tab = !state.jira_tab,
+        KeyCode::PageDown => state.card_scroll = state.card_scroll.saturating_add(8),
+        KeyCode::PageUp => state.card_scroll = state.card_scroll.saturating_sub(8),
+        KeyCode::Char('r') => {
+            state.requested_key = None;
+            state.card_loading = false;
         }
         _ => {}
     }
@@ -937,6 +1010,7 @@ fn draw(
     state: &State,
     jira: Option<&JiraClient>,
     jira_error: Option<&str>,
+    week_report: Option<&WeekReport>,
 ) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -946,19 +1020,27 @@ fn draw(
             Constraint::Length(1),
         ])
         .split(frame.area());
-    draw_header(frame, areas[0], state);
+    draw_header(frame, areas[0], state, week_report);
 
     if areas[1].width >= 100 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(areas[1]);
-        draw_tasks(frame, panes[0], entries, state);
+        if let Some(report) = week_report {
+            draw_week_tasks(frame, panes[0], report, state.selected);
+        } else {
+            draw_tasks(frame, panes[0], entries, state);
+        }
         draw_jira_card(frame, panes[1], state, jira, jira_error);
     } else if state.jira_tab {
         draw_jira_card(frame, areas[1], state, jira, jira_error);
     } else {
-        draw_tasks(frame, areas[1], entries, state);
+        if let Some(report) = week_report {
+            draw_week_tasks(frame, areas[1], report, state.selected);
+        } else {
+            draw_tasks(frame, areas[1], entries, state);
+        }
     }
 
     frame.render_widget(
@@ -986,8 +1068,18 @@ fn draw(
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, state: &State) {
-    let mut title = if state.show_history {
+fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option<&WeekReport>) {
+    let mut title = if let Some(report) = week_report {
+        format!(
+            "ZLS / WEEK / {}-W{:02} / {} TO {} / {} DONE / {} JIRA",
+            report.iso_year,
+            report.iso_week,
+            report.start,
+            report.end,
+            report.completed,
+            report.jira_linked,
+        )
+    } else if state.show_history {
         "ZLS / HISTORY".to_owned()
     } else {
         format!("ZLS / TODAY / {}", today())
@@ -995,13 +1087,87 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State) {
     if !state.task_query.is_empty() {
         title.push_str(&format!(" / SEARCH: {}", state.task_query));
     }
+    let hint = if week_report.is_some() {
+        "j/k select  Left/Right week  0 current  e docs  Enter Jira  W/Esc close  q quit".to_owned()
+    } else {
+        compact_hint()
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(title, Style::default().add_modifier(Modifier::BOLD)),
-            Line::styled(compact_hint(), Style::default().add_modifier(Modifier::DIM)),
+            Line::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         ]),
         area,
     );
+}
+
+fn draw_week_tasks(frame: &mut Frame, area: Rect, report: &WeekReport, selected: usize) {
+    let mut items = Vec::new();
+    let mut task_index = 0;
+    let mut selected_row = None;
+    for day in &report.days {
+        let title = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
+            .map(|date| date.format("%A / %Y-%m-%d").to_string())
+            .unwrap_or_else(|_| day.date.clone());
+        items.push(ListItem::new(Line::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if day.tasks.is_empty() {
+            items.push(ListItem::new(Line::styled(
+                "  No completed tasks.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+        for entry in &day.tasks {
+            if task_index == selected {
+                selected_row = Some(items.len());
+            }
+            items.push(weekly_task_item(entry));
+            task_index += 1;
+        }
+    }
+    if !report.undated.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "Undated",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for entry in &report.undated {
+            if task_index == selected {
+                selected_row = Some(items.len());
+            }
+            items.push(weekly_task_item(entry));
+            task_index += 1;
+        }
+    }
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::RIGHT)
+                .title(" WEEKLY / <- older / newer -> / 0 current / Esc close "),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut list_state = ListState::default().with_selected(selected_row);
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn weekly_task_item(entry: &Entry) -> ListItem<'static> {
+    let jira = entry
+        .task
+        .jira
+        .as_ref()
+        .map_or_else(String::new, |key| format!(" [{key}]"));
+    let docs = if entry.task.doc.is_some() {
+        " [doc]"
+    } else {
+        ""
+    };
+    ListItem::new(format!("  [x] {}{jira}{docs}", entry.task.text))
 }
 
 fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
