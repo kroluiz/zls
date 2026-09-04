@@ -6,9 +6,9 @@ use std::{
 
 mod configuration;
 mod jira;
+mod week;
 
 use anyhow::Result;
-use chrono::NaiveDate;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -18,7 +18,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -63,8 +63,7 @@ struct State {
     configuration: configuration::State,
     task_query: String,
     edit_document: bool,
-    weekly: bool,
-    weeks_ago: u32,
+    week: week::State,
 }
 
 impl State {
@@ -84,8 +83,7 @@ impl State {
             configuration,
             task_query: String::new(),
             edit_document: false,
-            weekly: false,
-            weeks_ago: 0,
+            week: week::State::default(),
         }
     }
 }
@@ -142,10 +140,7 @@ fn run_loop(
         if let Some(message) = state.configuration.poll() {
             state.message = message;
         }
-        let week_report = state
-            .weekly
-            .then(|| store.week_report_weeks_ago(state.weeks_ago))
-            .transpose()?;
+        let week_report = state.week.report(store)?;
         let entries = week_report.as_ref().map_or_else(
             || {
                 entries(
@@ -157,9 +152,18 @@ fn run_loop(
             },
             WeekReport::entries,
         );
-        state.selected = state.selected.min(entries.len().saturating_sub(1));
+        if state.week.is_active() {
+            state.week.clamp_selection(entries.len());
+        } else {
+            state.selected = state.selected.min(entries.len().saturating_sub(1));
+        }
+        let selected = if state.week.is_active() {
+            state.week.selected()
+        } else {
+            state.selected
+        };
         let selected_issue = entries
-            .get(state.selected)
+            .get(selected)
             .and_then(|entry| entry.task.jira.clone());
         state.jira.select_issue(selected_issue);
 
@@ -225,8 +229,9 @@ fn run_loop(
                 let action = state.jira.handle_confirmation_key(key.code);
                 apply_jira_action(action, &mut state, store)?;
             }
-            Mode::Normal if state.weekly => {
-                if handle_week_key(key.code, &entries, &mut state)? {
+            Mode::Normal if state.week.is_active() => {
+                let action = state.week.handle_key(key.code, entries.len());
+                if apply_week_action(action, &mut state) {
                     return Ok(());
                 }
             }
@@ -264,8 +269,7 @@ fn handle_normal_key(
         }
         KeyCode::Esc => return Ok(true),
         KeyCode::Char('W') => {
-            state.weekly = true;
-            state.weeks_ago = 0;
+            state.week.open();
             state.selected = 0;
             state.jira_tab = false;
             state.task_query.clear();
@@ -337,43 +341,23 @@ fn handle_normal_key(
     Ok(false)
 }
 
-fn handle_week_key(key: KeyCode, entries: &[Entry], state: &mut State) -> Result<bool> {
-    match key {
-        KeyCode::Char('q') => return Ok(true),
-        KeyCode::Esc | KeyCode::Char('W') => {
-            state.weekly = false;
+fn apply_week_action(action: week::Action, state: &mut State) -> bool {
+    match action {
+        week::Action::None => {}
+        week::Action::Quit => return true,
+        week::Action::Close => {
             state.selected = 0;
             state.jira_tab = false;
         }
-        KeyCode::Left => {
-            state.weeks_ago = state.weeks_ago.saturating_add(1);
-            state.selected = 0;
-        }
-        KeyCode::Right => {
-            state.weeks_ago = state.weeks_ago.saturating_sub(1);
-            state.selected = 0;
-        }
-        KeyCode::Char('0') => {
-            state.weeks_ago = 0;
-            state.selected = 0;
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.selected = state.selected.saturating_sub(1);
-            state.jira.reset_scroll();
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.selected = (state.selected + 1).min(entries.len().saturating_sub(1));
-            state.jira.reset_scroll();
-        }
-        KeyCode::Char('e') if !entries.is_empty() => state.edit_document = true,
-        KeyCode::Enter if !entries.is_empty() => state.jira_tab = true,
-        KeyCode::Tab => state.jira_tab = !state.jira_tab,
-        KeyCode::PageDown => state.jira.scroll_down(),
-        KeyCode::PageUp => state.jira.scroll_up(),
-        KeyCode::Char('r') => state.jira.refresh(),
-        _ => {}
+        week::Action::JiraFocus => state.jira_tab = true,
+        week::Action::JiraToggleFocus => state.jira_tab = !state.jira_tab,
+        week::Action::JiraResetScroll => state.jira.reset_scroll(),
+        week::Action::JiraScrollDown => state.jira.scroll_down(),
+        week::Action::JiraScrollUp => state.jira.scroll_up(),
+        week::Action::JiraRefresh => state.jira.refresh(),
+        week::Action::EditDocument => state.edit_document = true,
     }
-    Ok(false)
+    false
 }
 
 fn handle_add_key(key: KeyCode, state: &mut State, store: &mut Store, backlog: bool) -> Result<()> {
@@ -581,7 +565,12 @@ fn edit_selected_document(
     store: &mut Store,
     docs_path: &Path,
 ) -> Result<()> {
-    let Some(entry) = entries.get(state.selected) else {
+    let selected = if state.week.is_active() {
+        state.week.selected()
+    } else {
+        state.selected
+    };
+    let Some(entry) = entries.get(selected) else {
         state.message = "Select a task to document".to_owned();
         return Ok(());
     };
@@ -673,11 +662,11 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(areas[1]);
         if let Some(report) = week_report {
-            draw_week_tasks(
+            week::draw(
                 frame,
                 panes[0],
                 report,
-                state.selected,
+                state.week.selected(),
                 state.configuration.accent(),
             );
         } else {
@@ -688,11 +677,11 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
         jira::draw_card(frame, areas[1], &state.jira, state.configuration.accent());
     } else {
         if let Some(report) = week_report {
-            draw_week_tasks(
+            week::draw(
                 frame,
                 areas[1],
                 report,
-                state.selected,
+                state.week.selected(),
                 state.configuration.accent(),
             );
         } else {
@@ -731,15 +720,7 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option<&WeekReport>) {
     let mut title = if let Some(report) = week_report {
-        format!(
-            "ZLS / WEEK / {}-W{:02} / {} TO {} / {} DONE / {} JIRA",
-            report.iso_year,
-            report.iso_week,
-            report.start,
-            report.end,
-            report.completed,
-            report.jira_linked,
-        )
+        week::title(report)
     } else if state.show_history {
         "ZLS / HISTORY".to_owned()
     } else {
@@ -749,7 +730,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
         title.push_str(&format!(" / SEARCH: {}", state.task_query));
     }
     let hint = if week_report.is_some() {
-        "j/k select  Left/Right week  0 current  e docs  Enter Jira  W/Esc close  q quit".to_owned()
+        week::HINT.to_owned()
     } else {
         compact_hint()
     };
@@ -760,79 +741,6 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
         ]),
         area,
     );
-}
-
-fn draw_week_tasks(
-    frame: &mut Frame,
-    area: Rect,
-    report: &WeekReport,
-    selected: usize,
-    accent: Color,
-) {
-    let mut items = Vec::new();
-    let mut task_index = 0;
-    let mut selected_row = None;
-    for day in &report.days {
-        let title = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
-            .map(|date| date.format("%A / %Y-%m-%d").to_string())
-            .unwrap_or_else(|_| day.date.clone());
-        items.push(ListItem::new(Line::styled(
-            title,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        )));
-        if day.tasks.is_empty() {
-            items.push(ListItem::new(Line::styled(
-                "  No completed tasks.",
-                Style::default().add_modifier(Modifier::DIM),
-            )));
-        }
-        for entry in &day.tasks {
-            if task_index == selected {
-                selected_row = Some(items.len());
-            }
-            items.push(weekly_task_item(entry));
-            task_index += 1;
-        }
-    }
-    if !report.undated.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "Undated",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for entry in &report.undated {
-            if task_index == selected {
-                selected_row = Some(items.len());
-            }
-            items.push(weekly_task_item(entry));
-            task_index += 1;
-        }
-    }
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::TOP | Borders::RIGHT)
-                .title(" WEEKLY / <- older / newer -> / 0 current / Esc close "),
-        )
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    let mut list_state = ListState::default().with_selected(selected_row);
-    frame.render_stateful_widget(list, area, &mut list_state);
-}
-
-fn weekly_task_item(entry: &Entry) -> ListItem<'static> {
-    let jira = entry
-        .task
-        .jira
-        .as_ref()
-        .map_or_else(String::new, |key| format!(" [{key}]"));
-    let docs = if entry.task.doc.is_some() {
-        " [doc]"
-    } else {
-        ""
-    };
-    ListItem::new(format!("  [x] {}{jira}{docs}", entry.task.text))
 }
 
 fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
@@ -1090,11 +998,8 @@ mod tests {
     fn configuration_opens_and_closes_without_leaving_week_view() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::load(directory.path().join("todo.md"))?;
-        let mut state = State {
-            weekly: true,
-            mode: Mode::Normal,
-            ..State::default()
-        };
+        let mut state = State::default();
+        state.week.open();
 
         assert!(handle_global_overlay_key(KeyCode::Char('g'), &mut state));
         assert!(matches!(state.mode, Mode::Configuration));
@@ -1104,7 +1009,31 @@ mod tests {
         apply_configuration_action(action, &mut state, &mut store)?;
 
         assert!(matches!(state.mode, Mode::Normal));
-        assert!(state.weekly);
+        assert!(state.week.is_active());
+        Ok(())
+    }
+
+    #[test]
+    fn week_selection_is_independent_from_normal_task_selection() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        store.add("first")?;
+        store.add("second")?;
+        let entries = store.entries_today();
+        let mut state = State {
+            selected: 1,
+            ..State::default()
+        };
+
+        handle_normal_key(KeyCode::Char('W'), &entries, &mut state, &mut store)?;
+        state.week.handle_key(KeyCode::Down, 3);
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.week.selected(), 1);
+        let action = state.week.handle_key(KeyCode::Esc, 3);
+        apply_week_action(action, &mut state);
+
+        assert_eq!(state.selected, 0);
+        assert!(!state.week.is_active());
         Ok(())
     }
 
