@@ -7,8 +7,10 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+mod configuration;
 
 use anyhow::Result;
 use chrono::NaiveDate;
@@ -27,7 +29,7 @@ use ratatui::{
 };
 
 use crate::{
-    config::{AppConfig, DEFAULT_ACCENT, config_path, parse_hex_color},
+    config::{AppConfig, config_path},
     docs,
     jira::{
         IssueCard, IssueSummary, JiraClient, JiraComment, JiraConfig, ProjectSummary, Transition,
@@ -36,84 +38,6 @@ use crate::{
     keybindings::{KEYBINDINGS, Section, compact_hint},
     store::{BACKLOG, Entry, Store, WeekReport, today, tomorrow},
 };
-
-struct AccentPreset {
-    name: &'static str,
-    hex: &'static str,
-}
-
-const ACCENT_PRESETS: &[AccentPreset] = &[
-    AccentPreset {
-        name: "Cyan",
-        hex: "#00FFFF",
-    },
-    AccentPreset {
-        name: "Ocean",
-        hex: "#5FAFFF",
-    },
-    AccentPreset {
-        name: "Sky",
-        hex: "#89B4FA",
-    },
-    AccentPreset {
-        name: "Periwinkle",
-        hex: "#8CAAEE",
-    },
-    AccentPreset {
-        name: "Teal",
-        hex: "#94E2D5",
-    },
-    AccentPreset {
-        name: "Mint",
-        hex: "#A6E3A1",
-    },
-    AccentPreset {
-        name: "Sage",
-        hex: "#B8C0A0",
-    },
-    AccentPreset {
-        name: "Lavender",
-        hex: "#CBA6F7",
-    },
-    AccentPreset {
-        name: "Lilac",
-        hex: "#B4BEFE",
-    },
-    AccentPreset {
-        name: "Mauve",
-        hex: "#C6A0F6",
-    },
-    AccentPreset {
-        name: "Pink",
-        hex: "#F5C2E7",
-    },
-    AccentPreset {
-        name: "Rose",
-        hex: "#F38BA8",
-    },
-    AccentPreset {
-        name: "Coral",
-        hex: "#EA999C",
-    },
-    AccentPreset {
-        name: "Peach",
-        hex: "#FAB387",
-    },
-    AccentPreset {
-        name: "Amber",
-        hex: "#F9E2AF",
-    },
-    AccentPreset {
-        name: "Silver",
-        hex: "#BAC2DE",
-    },
-];
-
-const CONFIG_ACCENT: usize = 3;
-const CONFIG_PROJECT: usize = 4;
-const CONFIG_TEST_JIRA: usize = 10;
-const CONFIG_LAST_WITH_JIRA: usize = CONFIG_TEST_JIRA;
-const JIRA_CONNECTION_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -141,14 +65,6 @@ enum JiraEvent {
     Transitioned(String, Result<(), String>),
     Comment(String, Result<JiraComment, String>),
     MoreComments(String, Result<Vec<JiraComment>, String>),
-    Connection(u64, Instant, Result<String, String>),
-}
-
-enum JiraConnectionStatus {
-    NotChecked,
-    Checking,
-    Connected(String),
-    Failed(String),
 }
 
 struct State {
@@ -174,32 +90,20 @@ struct State {
     project_loading: bool,
     project_generation: u64,
     project_error: bool,
-    jira_connection_status: JiraConnectionStatus,
-    jira_connection_checked_at: Option<Instant>,
-    jira_connection_generation: u64,
     transition_results: Vec<Transition>,
     transition_selected: usize,
     transition_loading: bool,
     move_selected: usize,
     help_scroll: u16,
-    config_selected: usize,
-    config_path: String,
-    task_path: String,
-    jira_config: Option<JiraConfig>,
+    configuration: configuration::State,
     task_query: String,
-    docs_path: String,
     edit_document: bool,
     weekly: bool,
     weeks_ago: u32,
-    accent: Color,
-    accent_hex: String,
-    accent_original: String,
-    accent_selected: Option<usize>,
-    accent_columns: usize,
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl State {
+    fn new(configuration: configuration::State) -> Self {
         Self {
             selected: 0,
             show_history: false,
@@ -223,29 +127,24 @@ impl Default for State {
             project_loading: false,
             project_generation: 0,
             project_error: false,
-            jira_connection_status: JiraConnectionStatus::NotChecked,
-            jira_connection_checked_at: None,
-            jira_connection_generation: 0,
             transition_results: Vec::new(),
             transition_selected: 0,
             transition_loading: false,
             move_selected: 0,
             help_scroll: 0,
-            config_selected: 0,
-            config_path: String::new(),
-            task_path: String::new(),
-            jira_config: None,
+            configuration,
             task_query: String::new(),
-            docs_path: String::new(),
             edit_document: false,
             weekly: false,
             weeks_ago: 0,
-            accent: Color::Rgb(0, 255, 255),
-            accent_hex: DEFAULT_ACCENT.to_owned(),
-            accent_original: DEFAULT_ACCENT.to_owned(),
-            accent_selected: Some(0),
-            accent_columns: 4,
         }
+    }
+}
+
+#[cfg(test)]
+impl Default for State {
+    fn default() -> Self {
+        Self::new(configuration::State::default())
     }
 }
 
@@ -274,22 +173,16 @@ fn run_loop(
         Err(error) => (None, Some(error.to_string())),
     };
     let (sender, receiver) = mpsc::channel();
-    let mut state = State {
-        config_path: config_path()?.display().to_string(),
-        task_path: store.path().display().to_string(),
-        docs_path: docs_path.display().to_string(),
-        accent: accent_color(&config.ui.accent)?,
-        accent_hex: config.ui.accent.clone(),
-        accent_original: config.ui.accent.clone(),
-        accent_selected: ACCENT_PRESETS
-            .iter()
-            .position(|preset| preset.hex.eq_ignore_ascii_case(&config.ui.accent)),
-        jira_config: jira
-            .as_ref()
+    let configuration = configuration::State::new(
+        config_path()?.display().to_string(),
+        store.path().display().to_string(),
+        docs_path.display().to_string(),
+        config.ui.accent.clone(),
+        jira.as_ref()
             .map(|client| client.config().clone())
             .or_else(|| JiraConfig::load().ok()),
-        ..State::default()
-    };
+    )?;
+    let mut state = State::new(configuration);
     let carried = store.carry()?;
     if carried > 0 {
         state.message = format!(
@@ -299,8 +192,11 @@ fn run_loop(
     }
 
     loop {
-        state.accent_columns = if terminal.size()?.width >= 92 { 4 } else { 2 };
+        state.configuration.set_width(terminal.size()?.width);
         handle_jira_events(&mut state, &receiver, &sender, jira.as_ref());
+        if let Some(message) = state.configuration.poll() {
+            state.message = message;
+        }
         let week_report = state
             .weekly
             .then(|| store.week_report_weeks_ago(state.weeks_ago))
@@ -338,13 +234,7 @@ fn run_loop(
         if key.kind == KeyEventKind::Release {
             continue;
         }
-        if handle_global_overlay_key(
-            key.code,
-            &mut state,
-            jira.as_ref(),
-            jira_error.as_deref(),
-            &sender,
-        ) {
+        if handle_global_overlay_key(key.code, &mut state, jira.as_ref(), jira_error.as_deref()) {
             continue;
         }
 
@@ -353,17 +243,31 @@ fn run_loop(
             Mode::AddBacklog => handle_add_key(key.code, &mut state, store, true)?,
             Mode::Move => handle_move_key(key.code, &entries, &mut state, store)?,
             Mode::Help => handle_help_key(key.code, &mut state),
-            Mode::Configuration => handle_configuration_key(
-                key.code,
+            Mode::Configuration => apply_configuration_action(
+                configuration::State::handle_overview(
+                    &mut state.configuration,
+                    key.code,
+                    jira.as_ref(),
+                    jira_error.as_deref(),
+                ),
                 &mut state,
                 jira.as_ref(),
-                jira_error.as_deref(),
                 &sender,
             ),
-            Mode::AccentPalette => {
-                handle_accent_palette_key(key.code, &mut state, config)?;
-            }
-            Mode::AccentCustom => handle_accent_custom_key(key.code, &mut state, config)?,
+            Mode::AccentPalette => apply_configuration_action(
+                state
+                    .configuration
+                    .handle_accent_palette(key.code, config)?,
+                &mut state,
+                jira.as_ref(),
+                &sender,
+            ),
+            Mode::AccentCustom => apply_configuration_action(
+                state.configuration.handle_custom_accent(key.code, config)?,
+                &mut state,
+                jira.as_ref(),
+                &sender,
+            ),
             Mode::TaskSearch => handle_task_search_key(key.code, &mut state),
             Mode::Search => handle_search_key(key.code, &mut state, store, jira.as_ref(), &sender)?,
             Mode::Project => {
@@ -669,7 +573,6 @@ fn handle_global_overlay_key(
     state: &mut State,
     jira: Option<&JiraClient>,
     jira_error: Option<&str>,
-    sender: &Sender<JiraEvent>,
 ) -> bool {
     match key {
         KeyCode::Char('?') if state.mode == Mode::Help => {
@@ -693,10 +596,9 @@ fn handle_global_overlay_key(
             true
         }
         KeyCode::Char('g') if state.mode == Mode::Normal => {
-            state.config_selected = 0;
             state.mode = Mode::Configuration;
-            if jira_connection_test_due(state, Instant::now()) {
-                request_jira_connection_test(state, jira, jira_error, sender);
+            if let Some(message) = state.configuration.open(jira, jira_error) {
+                state.message = message;
             }
             true
         }
@@ -704,157 +606,36 @@ fn handle_global_overlay_key(
     }
 }
 
-fn handle_configuration_key(
-    key: KeyCode,
+fn apply_configuration_action(
+    action: configuration::Action,
     state: &mut State,
     jira: Option<&JiraClient>,
-    jira_error: Option<&str>,
     sender: &Sender<JiraEvent>,
 ) {
-    match key {
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.config_selected = state.config_selected.saturating_sub(1);
+    match action {
+        configuration::Action::None => {}
+        configuration::Action::Close => {
+            state.mode = match state.mode {
+                Mode::AccentCustom => Mode::AccentPalette,
+                Mode::AccentPalette => Mode::Configuration,
+                _ => Mode::Normal,
+            };
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.config_selected = (state.config_selected + 1).min(CONFIG_LAST_WITH_JIRA);
+        configuration::Action::OpenAccent => state.mode = Mode::AccentPalette,
+        configuration::Action::OpenCustomAccent => state.mode = Mode::AccentCustom,
+        configuration::Action::OpenProject => {
+            if let Some(client) = jira {
+                open_project_selector(state, client, sender);
+            }
         }
-        KeyCode::Enter => match state.config_selected {
-            CONFIG_ACCENT => {
-                state.accent_original = state.accent_hex.clone();
-                state.accent_selected = ACCENT_PRESETS
-                    .iter()
-                    .position(|preset| preset.hex.eq_ignore_ascii_case(&state.accent_hex));
-                state.mode = Mode::AccentPalette;
-            }
-            CONFIG_PROJECT => {
-                if let Some(client) = jira {
-                    open_project_selector(state, client, sender);
-                } else {
-                    state.message = jira_error.unwrap_or("Jira is unavailable").to_owned();
-                }
-            }
-            CONFIG_TEST_JIRA => {
-                request_jira_connection_test(state, jira, jira_error, sender);
-            }
-            _ => state.message = "This configuration value is read-only".to_owned(),
-        },
-        KeyCode::Char('g' | 'q') | KeyCode::Esc => state.mode = Mode::Normal,
-        _ => {}
-    }
-}
-
-fn handle_accent_palette_key(
-    key: KeyCode,
-    state: &mut State,
-    config: &mut AppConfig,
-) -> Result<()> {
-    match key {
-        KeyCode::Esc => {
-            state.accent_hex = state.accent_original.clone();
-            state.accent = accent_color(&state.accent_hex)?;
+        configuration::Action::Message(message) => {
+            state.message = message;
+        }
+        configuration::Action::AccentSaved(message) => {
+            state.message = message;
             state.mode = Mode::Configuration;
         }
-        KeyCode::Char('c') => {
-            state.input.clear();
-            state.mode = Mode::AccentCustom;
-        }
-        KeyCode::Char('d') => save_accent(state, config, DEFAULT_ACCENT)?,
-        KeyCode::Enter => {
-            let accent = state.accent_selected.map_or_else(
-                || state.accent_hex.clone(),
-                |index| ACCENT_PRESETS[index].hex.to_owned(),
-            );
-            save_accent(state, config, &accent)?;
-        }
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
-            let mut selected = state.accent_selected.unwrap_or(0);
-            let columns = state.accent_columns;
-            selected = match key {
-                KeyCode::Left if !selected.is_multiple_of(columns) => selected - 1,
-                KeyCode::Right
-                    if selected % columns < columns - 1 && selected + 1 < ACCENT_PRESETS.len() =>
-                {
-                    selected + 1
-                }
-                KeyCode::Up if selected >= columns => selected - columns,
-                KeyCode::Down if selected + columns < ACCENT_PRESETS.len() => selected + columns,
-                _ => selected,
-            };
-            state.accent_selected = Some(selected);
-            state.accent_hex = ACCENT_PRESETS[selected].hex.to_owned();
-            state.accent = accent_color(&state.accent_hex)?;
-        }
-        _ => {}
     }
-    Ok(())
-}
-
-fn handle_accent_custom_key(key: KeyCode, state: &mut State, config: &mut AppConfig) -> Result<()> {
-    match key {
-        KeyCode::Enter => {
-            let accent = state.input.to_ascii_uppercase();
-            match accent_color(&accent) {
-                Ok(color) => {
-                    config.set_accent(&accent)?;
-                    state.accent = color;
-                    state.accent_hex = accent.clone();
-                    state.accent_original = accent;
-                    state.accent_selected = ACCENT_PRESETS
-                        .iter()
-                        .position(|preset| preset.hex == state.accent_hex);
-                    state.input.clear();
-                    state.message = format!("Accent saved as {}", state.accent_hex);
-                    state.mode = Mode::Configuration;
-                }
-                Err(error) => state.message = error.to_string(),
-            }
-        }
-        KeyCode::Esc => {
-            state.input.clear();
-            state.accent_hex = state.accent_selected.map_or_else(
-                || state.accent_original.clone(),
-                |index| ACCENT_PRESETS[index].hex.to_owned(),
-            );
-            state.accent = accent_color(&state.accent_hex)?;
-            state.mode = Mode::AccentPalette;
-        }
-        KeyCode::Backspace => {
-            state.input.pop();
-            preview_custom_accent(state);
-        }
-        KeyCode::Char(character) => {
-            state.input.push(character);
-            preview_custom_accent(state);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn preview_custom_accent(state: &mut State) {
-    let accent = state.input.to_ascii_uppercase();
-    if let Ok(color) = accent_color(&accent) {
-        state.accent = color;
-        state.accent_hex = accent;
-    }
-}
-
-fn save_accent(state: &mut State, config: &mut AppConfig, accent: &str) -> Result<()> {
-    config.set_accent(accent)?;
-    state.accent = accent_color(accent)?;
-    state.accent_hex = accent.to_owned();
-    state.accent_original = accent.to_owned();
-    state.accent_selected = ACCENT_PRESETS
-        .iter()
-        .position(|preset| preset.hex == accent);
-    state.message = format!("Accent saved as {accent}");
-    state.mode = Mode::Configuration;
-    Ok(())
-}
-
-fn accent_color(hex: &str) -> Result<Color> {
-    let (red, green, blue) = parse_hex_color(hex)?;
-    Ok(Color::Rgb(red, green, blue))
 }
 
 fn handle_task_search_key(key: KeyCode, state: &mut State) {
@@ -956,7 +737,7 @@ fn handle_project_key(
             let project = &state.project_results[state.project_selected];
             if let Some(client) = jira.as_mut() {
                 client.set_project(&project.key)?;
-                state.jira_config = Some(client.config().clone());
+                state.configuration.set_jira_config(client.config().clone());
                 state.message = format!("Jira project set to {} ({})", project.key, project.name);
                 state.mode = Mode::Configuration;
                 state.search_results.clear();
@@ -1096,7 +877,8 @@ fn edit_selected_document(
         return Ok(());
     };
     let prepared = (|| -> Result<_> {
-        let (path, link) = docs::ensure_document(docs_path, entry, state.jira_config.as_ref())?;
+        let (path, link) =
+            docs::ensure_document(docs_path, entry, state.configuration.jira_config())?;
         if entry.task.doc.is_none() {
             store.link_document(&entry.task.id, &link)?;
         }
@@ -1152,47 +934,6 @@ fn request_search(
             .search_issues(&query)
             .map_err(|error| error.to_string());
         let _ = sender.send(JiraEvent::Search(generation, result));
-    });
-}
-
-fn jira_connection_test_due(state: &State, now: Instant) -> bool {
-    !matches!(state.jira_connection_status, JiraConnectionStatus::Checking)
-        && state.jira_connection_checked_at.is_none_or(|checked_at| {
-            now.saturating_duration_since(checked_at) >= JIRA_CONNECTION_TTL
-        })
-}
-
-fn request_jira_connection_test(
-    state: &mut State,
-    jira: Option<&JiraClient>,
-    jira_error: Option<&str>,
-    sender: &Sender<JiraEvent>,
-) {
-    if matches!(state.jira_connection_status, JiraConnectionStatus::Checking) {
-        state.message = "Jira connection test is already running".to_owned();
-        return;
-    }
-    let Some(client) = jira else {
-        let error = jira_error
-            .unwrap_or("Jira is unavailable; check credentials and token")
-            .to_owned();
-        state.jira_connection_status = JiraConnectionStatus::Failed(error.clone());
-        state.jira_connection_checked_at = Some(Instant::now());
-        state.message = error;
-        return;
-    };
-    state.jira_connection_generation = state.jira_connection_generation.wrapping_add(1);
-    let generation = state.jira_connection_generation;
-    state.jira_connection_status = JiraConnectionStatus::Checking;
-    state.message = "Testing Jira connection...".to_owned();
-    let client = client.clone();
-    let sender = sender.clone();
-    thread::spawn(move || {
-        let result = client
-            .test_auth()
-            .map(|user| user.display_name)
-            .map_err(|error| error.to_string());
-        let _ = sender.send(JiraEvent::Connection(generation, Instant::now(), result));
     });
 }
 
@@ -1324,22 +1065,6 @@ fn handle_jira_events(
                     Err(error) => state.message = error,
                 }
             }
-            JiraEvent::Connection(generation, checked_at, result)
-                if generation == state.jira_connection_generation =>
-            {
-                state.jira_connection_checked_at = Some(checked_at);
-                match result {
-                    Ok(display_name) => {
-                        state.message = format!("Jira connection verified as {display_name}");
-                        state.jira_connection_status =
-                            JiraConnectionStatus::Connected(display_name);
-                    }
-                    Err(error) => {
-                        state.message = error.clone();
-                        state.jira_connection_status = JiraConnectionStatus::Failed(error);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1411,7 +1136,13 @@ fn draw(
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(areas[1]);
         if let Some(report) = week_report {
-            draw_week_tasks(frame, panes[0], report, state.selected, state.accent);
+            draw_week_tasks(
+                frame,
+                panes[0],
+                report,
+                state.selected,
+                state.configuration.accent(),
+            );
         } else {
             draw_tasks(frame, panes[0], entries, state);
         }
@@ -1420,7 +1151,13 @@ fn draw(
         draw_jira_card(frame, areas[1], state, jira, jira_error);
     } else {
         if let Some(report) = week_report {
-            draw_week_tasks(frame, areas[1], report, state.selected, state.accent);
+            draw_week_tasks(
+                frame,
+                areas[1],
+                report,
+                state.selected,
+                state.configuration.accent(),
+            );
         } else {
             draw_tasks(frame, areas[1], entries, state);
         }
@@ -1436,13 +1173,11 @@ fn draw(
         Mode::AddBacklog => draw_single_input(frame, "New backlog task", &state.input),
         Mode::Move => draw_move_selector(frame, state),
         Mode::Help => draw_help(frame, state),
-        Mode::Configuration => draw_configuration(frame, state, jira_error),
-        Mode::AccentPalette => draw_accent_palette(frame, state),
-        Mode::AccentCustom => draw_single_input(
-            frame,
-            "Custom accent / #RRGGBB / Enter save / Esc back",
-            &state.input,
-        ),
+        Mode::Configuration => {
+            configuration::draw_overview(frame, &state.configuration, jira_error)
+        }
+        Mode::AccentPalette => configuration::draw_accent(frame, &state.configuration),
+        Mode::AccentCustom => configuration::draw_custom_accent(frame, &state.configuration),
         Mode::TaskSearch => draw_single_input(
             frame,
             "Search tasks / Enter keep / Esc clear",
@@ -1731,7 +1466,7 @@ fn draw_jira_card(
             Span::styled(
                 &card.key,
                 Style::default()
-                    .fg(state.accent)
+                    .fg(state.configuration.accent())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
@@ -1833,7 +1568,7 @@ fn draw_jira_card(
                 comment.author,
                 format_jira_datetime(&comment.created)
             ),
-            Style::default().fg(state.accent),
+            Style::default().fg(state.configuration.accent()),
         ));
         append_text(&mut lines, &comment.body, "");
         lines.push(Line::raw(""));
@@ -1862,28 +1597,6 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
         Span::raw(value.to_owned()),
-    ])
-}
-
-fn selectable_detail_line(
-    label: &str,
-    value: &str,
-    selected: bool,
-    accent: Color,
-) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{}{label:<12} ", if selected { "> " } else { "  " }),
-            Style::default().fg(if selected { accent } else { Color::DarkGray }),
-        ),
-        Span::styled(
-            value.to_owned(),
-            Style::default().add_modifier(if selected {
-                Modifier::REVERSED
-            } else {
-                Modifier::empty()
-            }),
-        ),
     ])
 }
 
@@ -1966,7 +1679,7 @@ fn draw_search(frame: &mut Frame, state: &State) {
                 Line::styled(
                     format!("{}  [{}]", issue.key, issue.status),
                     Style::default()
-                        .fg(state.accent)
+                        .fg(state.configuration.accent())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(&issue.summary),
@@ -2028,7 +1741,7 @@ fn draw_help(frame: &mut Frame, state: &State) {
         lines.push(Line::styled(
             section.title(),
             Style::default()
-                .fg(state.accent)
+                .fg(state.configuration.accent())
                 .add_modifier(Modifier::BOLD),
         ));
         for binding in KEYBINDINGS
@@ -2051,211 +1764,6 @@ fn draw_help(frame: &mut Frame, state: &State) {
             .scroll((state.help_scroll, 0)),
         inner,
     );
-}
-
-fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>) {
-    let area = centered_fixed(frame.area(), 70, 19);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" CONFIGURATION / arrows select / Enter action / g, q, or Esc close ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines = vec![
-        section_separator("ZLS", inner.width),
-        selectable_detail_line(
-            "Config file",
-            &state.config_path,
-            state.config_selected == 0,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Tasks file",
-            &state.task_path,
-            state.config_selected == 1,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Docs path",
-            &state.docs_path,
-            state.config_selected == 2,
-            state.accent,
-        ),
-        Line::raw(""),
-        section_separator("APPEARANCE", inner.width),
-        selectable_detail_line(
-            "Accent",
-            &state.accent_hex,
-            state.config_selected == CONFIG_ACCENT,
-            state.accent,
-        ),
-        Line::raw(""),
-        section_separator("JIRA", inner.width),
-    ];
-    let config = state.jira_config.as_ref();
-    let connection = match &state.jira_connection_status {
-        JiraConnectionStatus::NotChecked if jira_error.is_some() || config.is_none() => {
-            "Unavailable".to_owned()
-        }
-        JiraConnectionStatus::NotChecked => "Not checked".to_owned(),
-        JiraConnectionStatus::Checking => "Checking...".to_owned(),
-        JiraConnectionStatus::Connected(display_name) => {
-            format!("Connected as {display_name}")
-        }
-        JiraConnectionStatus::Failed(_) => "Failed - Enter to retry".to_owned(),
-    };
-    lines.extend([
-        selectable_detail_line(
-            "Project",
-            config
-                .and_then(|config| config.project.as_deref())
-                .unwrap_or("Not selected"),
-            state.config_selected == CONFIG_PROJECT,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Site",
-            config.map_or("Not configured", |config| config.site.as_str()),
-            state.config_selected == 5,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Email",
-            config.map_or("Not configured", |config| config.email.as_str()),
-            state.config_selected == 6,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Cloud ID",
-            config.map_or("Not configured", |config| config.cloud_id.as_str()),
-            state.config_selected == 7,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Credentials",
-            if jira_error.is_none() {
-                "Available"
-            } else {
-                "Unavailable"
-            },
-            state.config_selected == 8,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "API token",
-            "Hidden",
-            state.config_selected == 9,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Status",
-            &connection,
-            state.config_selected == CONFIG_TEST_JIRA,
-            state.accent,
-        ),
-    ]);
-    let mut connection_error_lines = 0;
-    if let JiraConnectionStatus::Failed(error) = &state.jira_connection_status {
-        let wrapped = wrap_fixed_width(&format!("Error: {error}"), usize::from(inner.width.max(1)));
-        let max_lines = usize::from(inner.height.saturating_sub(1));
-        connection_error_lines = wrapped.len().min(max_lines);
-        lines.extend(
-            wrapped
-                .into_iter()
-                .take(max_lines)
-                .map(|line| Line::styled(line, Style::default().fg(Color::Yellow))),
-        );
-    }
-    let mut selected_line = match state.config_selected {
-        0..=2 => state.config_selected + 1,
-        CONFIG_ACCENT => 6,
-        selected => selected + 5,
-    } as u16;
-    if state.config_selected == CONFIG_TEST_JIRA && connection_error_lines > 0 {
-        selected_line = selected_line.saturating_add(connection_error_lines as u16);
-    }
-    let scroll = selected_line.saturating_add(1).saturating_sub(inner.height);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
-}
-
-fn wrap_fixed_width(value: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for character in value.chars() {
-        if line.chars().count() == width {
-            lines.push(std::mem::take(&mut line));
-        }
-        line.push(character);
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
-fn draw_accent_palette(frame: &mut Frame, state: &State) {
-    let area = centered_fixed(frame.area(), 92, 14);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" ACCENT / arrows preview / Enter save / c custom / d default / Esc cancel ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let is_custom = !ACCENT_PRESETS
-        .iter()
-        .any(|preset| preset.hex.eq_ignore_ascii_case(&state.accent_original));
-    let mut lines = vec![
-        Line::from(vec![
-            Span::raw("Preview  "),
-            Span::styled(
-                format!("[ {} ]", state.accent_hex),
-                Style::default()
-                    .fg(state.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        if is_custom {
-            Line::styled(
-                format!("Current custom  {}", state.accent_original),
-                Style::default().add_modifier(Modifier::DIM),
-            )
-        } else {
-            Line::raw("")
-        },
-        Line::raw(""),
-    ];
-    let rows = ACCENT_PRESETS.len().div_ceil(state.accent_columns);
-    let cell_width = usize::from(inner.width) / state.accent_columns;
-    for row in 0..rows {
-        let mut spans = Vec::new();
-        for column in 0..state.accent_columns {
-            let index = row * state.accent_columns + column;
-            if index >= ACCENT_PRESETS.len() {
-                break;
-            }
-            let preset = &ACCENT_PRESETS[index];
-            let mut style = Style::default().fg(accent_color(preset.hex).unwrap_or(Color::Reset));
-            if state.accent_selected == Some(index) {
-                style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
-            }
-            let label = format!("{} {}", preset.name, preset.hex)
-                .chars()
-                .take(cell_width)
-                .collect::<String>();
-            spans.push(Span::styled(
-                format!("{label:<width$}", width = cell_width),
-                style,
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::styled(
-        "Custom values must use strict #RRGGBB format.",
-        Style::default().add_modifier(Modifier::DIM),
-    ));
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_project_selector(frame: &mut Frame, state: &State) {
@@ -2281,7 +1789,7 @@ fn draw_project_selector(frame: &mut Frame, state: &State) {
                 Line::styled(
                     &project.key,
                     Style::default()
-                        .fg(state.accent)
+                        .fg(state.configuration.accent())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(&project.name),
@@ -2410,20 +1918,7 @@ fn centered_fixed(area: Rect, width_percent: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DocsConfig, TasksConfig, UiConfig};
     use crate::store::Task;
-
-    fn test_config() -> AppConfig {
-        AppConfig {
-            tasks: TasksConfig {
-                path: "todo.md".into(),
-            },
-            docs: DocsConfig {
-                path: "docs".into(),
-            },
-            ui: UiConfig::default(),
-        }
-    }
 
     #[test]
     fn task_search_matches_all_visible_identifiers_case_insensitively() {
@@ -2447,97 +1942,6 @@ mod tests {
     }
 
     #[test]
-    fn accent_palette_has_sixteen_valid_unique_colors_with_cyan_default() {
-        assert_eq!(ACCENT_PRESETS.len(), 16);
-        assert_eq!(ACCENT_PRESETS[0].hex, DEFAULT_ACCENT);
-        for (index, preset) in ACCENT_PRESETS.iter().enumerate() {
-            assert!(parse_hex_color(preset.hex).is_ok());
-            assert!(
-                ACCENT_PRESETS[index + 1..]
-                    .iter()
-                    .all(|other| other.hex != preset.hex)
-            );
-        }
-    }
-
-    #[test]
-    fn accent_grid_stays_in_column_at_edges() -> Result<()> {
-        let mut state = State {
-            accent_selected: Some(1),
-            accent_columns: 4,
-            ..State::default()
-        };
-        let mut config = test_config();
-        handle_accent_palette_key(KeyCode::Up, &mut state, &mut config)?;
-        assert_eq!(state.accent_selected, Some(1));
-
-        state.accent_selected = Some(13);
-        handle_accent_palette_key(KeyCode::Down, &mut state, &mut config)?;
-        assert_eq!(state.accent_selected, Some(13));
-
-        state.accent_columns = 2;
-        state.accent_selected = Some(1);
-        handle_accent_palette_key(KeyCode::Up, &mut state, &mut config)?;
-        assert_eq!(state.accent_selected, Some(1));
-        Ok(())
-    }
-
-    #[test]
-    fn cancelling_custom_input_restores_the_palette_preview() -> Result<()> {
-        let mut state = State {
-            mode: Mode::AccentCustom,
-            accent_original: DEFAULT_ACCENT.to_owned(),
-            accent_hex: ACCENT_PRESETS[1].hex.to_owned(),
-            accent: accent_color(ACCENT_PRESETS[1].hex)?,
-            accent_selected: Some(1),
-            input: "#112233".to_owned(),
-            ..State::default()
-        };
-        preview_custom_accent(&mut state);
-        assert_eq!(state.accent_hex, "#112233");
-
-        handle_accent_custom_key(KeyCode::Esc, &mut state, &mut test_config())?;
-
-        assert_eq!(state.accent_hex, ACCENT_PRESETS[1].hex);
-        assert!(matches!(state.mode, Mode::AccentPalette));
-        Ok(())
-    }
-
-    #[test]
-    fn every_configuration_row_is_selectable() {
-        let (sender, _receiver) = mpsc::channel();
-        let mut state = State {
-            mode: Mode::Configuration,
-            jira_config: Some(JiraConfig {
-                site: "https://example.atlassian.net".to_owned(),
-                email: "user@example.com".to_owned(),
-                cloud_id: "cloud-id".to_owned(),
-                project: Some("OBS".to_owned()),
-            }),
-            ..State::default()
-        };
-
-        for expected in 1..=CONFIG_LAST_WITH_JIRA {
-            handle_configuration_key(KeyCode::Down, &mut state, None, None, &sender);
-            assert_eq!(state.config_selected, expected);
-        }
-        handle_configuration_key(KeyCode::Down, &mut state, None, None, &sender);
-        assert_eq!(state.config_selected, CONFIG_LAST_WITH_JIRA);
-        handle_configuration_key(KeyCode::Up, &mut state, None, None, &sender);
-        assert_eq!(state.config_selected, CONFIG_LAST_WITH_JIRA - 1);
-    }
-
-    #[test]
-    fn unselected_accent_uses_the_same_style_as_unselected_project() {
-        let accent = selectable_detail_line("Accent", "#00FFFF", false, Color::Cyan);
-        let project = selectable_detail_line("Project", "OBS", false, Color::Cyan);
-
-        assert_eq!(accent.spans[0].style, project.spans[0].style);
-        assert_eq!(accent.spans[1].style, project.spans[1].style);
-        assert!(!accent.spans[0].style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
     fn jira_project_selector_returns_to_configuration() -> Result<()> {
         let mut state = State {
             mode: Mode::Project,
@@ -2547,38 +1951,6 @@ mod tests {
         handle_project_key(KeyCode::Esc, &mut state, &mut None)?;
 
         assert!(matches!(state.mode, Mode::Configuration));
-        Ok(())
-    }
-
-    #[test]
-    fn jira_project_row_is_visible_in_a_short_popup() -> Result<()> {
-        let backend = ratatui::backend::TestBackend::new(60, 16);
-        let mut terminal = Terminal::new(backend)?;
-        let state = State {
-            config_selected: CONFIG_PROJECT,
-            config_path: "/home/user/a/very/long/configuration/path/zls/config.toml".to_owned(),
-            task_path: "/home/user/a/very/long/task/storage/path/todo.md".to_owned(),
-            docs_path: "/home/user/a/very/long/documentation/storage/path".to_owned(),
-            jira_config: Some(JiraConfig {
-                site: "https://example.atlassian.net".to_owned(),
-                email: "user@example.com".to_owned(),
-                cloud_id: "cloud-id".to_owned(),
-                project: Some("OBS".to_owned()),
-            }),
-            ..State::default()
-        };
-
-        terminal.draw(|frame| draw_configuration(frame, &state, None))?;
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Project"));
-        assert!(rendered.contains("OBS"));
         Ok(())
     }
 
@@ -2601,7 +1973,6 @@ mod tests {
 
     #[test]
     fn configuration_opens_and_closes_without_leaving_week_view() {
-        let (sender, _receiver) = mpsc::channel();
         let mut state = State {
             weekly: true,
             mode: Mode::Normal,
@@ -2612,11 +1983,13 @@ mod tests {
             KeyCode::Char('g'),
             &mut state,
             None,
-            None,
-            &sender
+            None
         ));
         assert!(matches!(state.mode, Mode::Configuration));
-        handle_configuration_key(KeyCode::Esc, &mut state, None, None, &sender);
+        let action = state
+            .configuration
+            .handle_overview(KeyCode::Esc, None, None);
+        apply_configuration_action(action, &mut state, None, &mpsc::channel().0);
 
         assert!(matches!(state.mode, Mode::Normal));
         assert!(state.weekly);
@@ -2624,7 +1997,6 @@ mod tests {
 
     #[test]
     fn help_returns_to_the_overlay_that_opened_it() {
-        let (sender, _receiver) = mpsc::channel();
         let mut state = State {
             mode: Mode::Configuration,
             ..State::default()
@@ -2634,8 +2006,7 @@ mod tests {
             KeyCode::Char('?'),
             &mut state,
             None,
-            None,
-            &sender
+            None
         ));
         assert!(matches!(state.mode, Mode::Help));
         handle_help_key(KeyCode::Esc, &mut state);
@@ -2645,7 +2016,6 @@ mod tests {
 
     #[test]
     fn global_overlay_keys_do_not_capture_text_input() {
-        let (sender, _receiver) = mpsc::channel();
         let mut state = State {
             mode: Mode::Add,
             ..State::default()
@@ -2655,110 +2025,36 @@ mod tests {
             KeyCode::Char('?'),
             &mut state,
             None,
-            None,
-            &sender
+            None
         ));
     }
 
     #[test]
-    fn jira_connection_result_expires_after_five_minutes() {
-        let checked_at = Instant::now();
-        let state = State {
-            jira_connection_status: JiraConnectionStatus::Connected("User".to_owned()),
-            jira_connection_checked_at: Some(checked_at),
-            ..State::default()
-        };
-
-        assert!(!jira_connection_test_due(
-            &state,
-            checked_at + JIRA_CONNECTION_TTL - Duration::from_secs(1)
-        ));
-        assert!(jira_connection_test_due(
-            &state,
-            checked_at + JIRA_CONNECTION_TTL
-        ));
-    }
-
-    #[test]
-    fn jira_connection_row_is_visible_when_selected() -> Result<()> {
-        let backend = ratatui::backend::TestBackend::new(60, 16);
-        let mut terminal = Terminal::new(backend)?;
-        let state = State {
-            config_selected: CONFIG_TEST_JIRA,
-            jira_connection_status: JiraConnectionStatus::Connected("Test User".to_owned()),
-            ..State::default()
-        };
-
-        terminal.draw(|frame| draw_configuration(frame, &state, None))?;
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Status"));
-        assert!(rendered.contains("Connected as Test User"));
-        Ok(())
-    }
-
-    #[test]
-    fn unavailable_jira_result_is_cached() {
+    fn configuration_actions_map_to_global_modes() {
         let (sender, _receiver) = mpsc::channel();
         let mut state = State::default();
 
-        request_jira_connection_test(&mut state, None, Some("missing Jira token"), &sender);
+        apply_configuration_action(configuration::Action::OpenAccent, &mut state, None, &sender);
+        assert!(matches!(state.mode, Mode::AccentPalette));
 
-        let checked_at = state.jira_connection_checked_at.unwrap();
-        assert!(matches!(
-            state.jira_connection_status,
-            JiraConnectionStatus::Failed(ref error) if error == "missing Jira token"
-        ));
-        assert!(!jira_connection_test_due(
-            &state,
-            checked_at + Duration::from_secs(60)
-        ));
-    }
+        apply_configuration_action(
+            configuration::Action::OpenCustomAccent,
+            &mut state,
+            None,
+            &sender,
+        );
+        assert!(matches!(state.mode, Mode::AccentCustom));
 
-    #[test]
-    fn repeated_jira_connection_test_is_ignored_while_checking() {
-        let (sender, _receiver) = mpsc::channel();
-        let mut state = State {
-            jira_connection_status: JiraConnectionStatus::Checking,
-            jira_connection_generation: 4,
-            ..State::default()
-        };
+        apply_configuration_action(configuration::Action::Close, &mut state, None, &sender);
+        assert!(matches!(state.mode, Mode::AccentPalette));
 
-        request_jira_connection_test(&mut state, None, Some("unavailable"), &sender);
-
-        assert_eq!(state.jira_connection_generation, 4);
-        assert_eq!(state.message, "Jira connection test is already running");
-    }
-
-    #[test]
-    fn jira_connection_error_is_visible_in_a_short_popup() -> Result<()> {
-        let backend = ratatui::backend::TestBackend::new(60, 16);
-        let mut terminal = Terminal::new(backend)?;
-        let state = State {
-            config_selected: CONFIG_TEST_JIRA,
-            jira_connection_status: JiraConnectionStatus::Failed(
-                "Jira authentication failed because the API token was rejected".to_owned(),
-            ),
-            ..State::default()
-        };
-
-        terminal.draw(|frame| draw_configuration(frame, &state, Some("authentication failed")))?;
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Status"));
-        assert!(rendered.contains("Error: Jira authentication failed"));
-        Ok(())
+        apply_configuration_action(
+            configuration::Action::AccentSaved("saved".to_owned()),
+            &mut state,
+            None,
+            &sender,
+        );
+        assert!(matches!(state.mode, Mode::Configuration));
+        assert_eq!(state.message, "saved");
     }
 }
