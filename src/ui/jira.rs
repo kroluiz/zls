@@ -26,13 +26,13 @@ use super::{
 };
 
 pub(super) enum Event {
-    Card(String, Box<Result<jira_api::IssueCard, String>>),
+    Card(u64, String, Box<Result<jira_api::IssueCard, String>>),
     Search(u64, Result<Vec<jira_api::IssueSummary>, String>),
     Projects(u64, Result<Vec<jira_api::ProjectSummary>, String>),
-    Transitions(String, Result<Vec<jira_api::Transition>, String>),
+    Transitions(u64, String, Result<Vec<jira_api::Transition>, String>),
     Transitioned(String, Result<(), String>),
     Comment(String, Result<jira_api::JiraComment, String>),
-    MoreComments(String, Result<Vec<jira_api::JiraComment>, String>),
+    MoreComments(u64, String, Result<Vec<jira_api::JiraComment>, String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +83,7 @@ pub(super) struct State {
     sender: Sender<AsyncEvent>,
     card: Option<jira_api::IssueCard>,
     requested_key: Option<String>,
+    card_generation: u64,
     card_loading: bool,
     card_scroll: u16,
     search_input: String,
@@ -99,7 +100,9 @@ pub(super) struct State {
     project_error: bool,
     transition_results: Vec<jira_api::Transition>,
     transition_selected: usize,
+    transition_generation: u64,
     transition_loading: bool,
+    more_comments_generation: u64,
     comment_input: String,
 }
 
@@ -129,6 +132,7 @@ impl State {
             sender,
             card: None,
             requested_key: None,
+            card_generation: 0,
             card_loading: false,
             card_scroll: 0,
             search_input: String::new(),
@@ -145,7 +149,9 @@ impl State {
             project_error: false,
             transition_results: Vec::new(),
             transition_selected: 0,
+            transition_generation: 0,
             transition_loading: false,
+            more_comments_generation: 0,
             comment_input: String::new(),
         }
     }
@@ -265,19 +271,25 @@ impl State {
         self.transition_results.clear();
         self.transition_selected = 0;
         self.transition_loading = true;
+        self.transition_generation = self.transition_generation.wrapping_add(1);
+        let generation = self.transition_generation;
         let event_key = key.clone();
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = client.transitions(&key).map_err(|error| error.to_string());
-            let _ = sender.send(AsyncEvent::Jira(Event::Transitions(event_key, result)));
+            let _ = sender.send(AsyncEvent::Jira(Event::Transitions(
+                generation, event_key, result,
+            )));
         });
         Action::mode(ModeIntent::Transition)
     }
 
-    pub(super) fn load_more_comments(&self) -> Action {
+    pub(super) fn load_more_comments(&mut self) -> Action {
         let (Some(client), Some(card)) = (self.client.as_ref(), self.card.as_ref()) else {
             return Action::default();
         };
+        self.more_comments_generation = self.more_comments_generation.wrapping_add(1);
+        let generation = self.more_comments_generation;
         let client = client.clone();
         let key = card.key.clone();
         let event_key = key.clone();
@@ -286,7 +298,9 @@ impl State {
             let result = client
                 .issue_comments(&key, 50)
                 .map_err(|error| error.to_string());
-            let _ = sender.send(AsyncEvent::Jira(Event::MoreComments(event_key, result)));
+            let _ = sender.send(AsyncEvent::Jira(Event::MoreComments(
+                generation, event_key, result,
+            )));
         });
         Action::notice("Loading more comments...")
     }
@@ -510,6 +524,8 @@ impl State {
         self.card = None;
         self.card_scroll = 0;
         self.card_loading = false;
+        self.card_generation = self.card_generation.wrapping_add(1);
+        let generation = self.card_generation;
         let (Some(key), Some(client)) = (key, self.client.as_ref()) else {
             return;
         };
@@ -519,7 +535,11 @@ impl State {
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = client.issue_card(&key).map_err(|error| error.to_string());
-            let _ = sender.send(AsyncEvent::Jira(Event::Card(event_key, Box::new(result))));
+            let _ = sender.send(AsyncEvent::Jira(Event::Card(
+                generation,
+                event_key,
+                Box::new(result),
+            )));
         });
     }
 
@@ -550,7 +570,10 @@ impl State {
 
     pub(super) fn apply_event(&mut self, event: Event) -> Option<Action> {
         let notice = match event {
-            Event::Card(key, result) if self.requested_key.as_deref() == Some(&key) => {
+            Event::Card(generation, key, result)
+                if generation == self.card_generation
+                    && self.requested_key.as_deref() == Some(&key) =>
+            {
                 self.card_loading = false;
                 match *result {
                     Ok(card) => {
@@ -596,8 +619,9 @@ impl State {
                     }
                 }
             }
-            Event::Transitions(key, result)
-                if self.card.as_ref().is_some_and(|card| card.key == key) =>
+            Event::Transitions(generation, key, result)
+                if generation == self.transition_generation
+                    && self.card.as_ref().is_some_and(|card| card.key == key) =>
             {
                 self.transition_loading = false;
                 match result {
@@ -623,8 +647,9 @@ impl State {
                 }
                 Err(error) => Some(error),
             },
-            Event::MoreComments(key, result)
-                if self.card.as_ref().is_some_and(|card| card.key == key) =>
+            Event::MoreComments(generation, key, result)
+                if generation == self.more_comments_generation
+                    && self.card.as_ref().is_some_and(|card| card.key == key) =>
             {
                 match result {
                     Ok(comments) => {
@@ -1028,6 +1053,44 @@ mod tests {
         State::with_client(None, None, Some("unavailable".to_owned()), sender)
     }
 
+    fn card(key: &str, summary: &str, comments: Vec<jira_api::JiraComment>) -> jira_api::IssueCard {
+        jira_api::IssueCard {
+            key: key.to_owned(),
+            summary: summary.to_owned(),
+            status: "Open".to_owned(),
+            priority: None,
+            assignee: None,
+            description: String::new(),
+            subtasks: Vec::new(),
+            links: Vec::new(),
+            comments,
+            creator: None,
+            reporter: None,
+            parent: None,
+            labels: Vec::new(),
+            sprints: Vec::new(),
+            issue_type: None,
+            components: Vec::new(),
+            fix_versions: Vec::new(),
+            created: None,
+            updated: None,
+            due_date: None,
+            resolution: None,
+            stale: false,
+            stale_reason: None,
+        }
+    }
+
+    fn comment(id: &str) -> jira_api::JiraComment {
+        jira_api::JiraComment {
+            id: id.to_owned(),
+            author: "User".to_owned(),
+            created: String::new(),
+            updated: String::new(),
+            body: id.to_owned(),
+        }
+    }
+
     #[test]
     fn loaded_config_is_retained_without_a_client() {
         let config = jira_api::JiraConfig {
@@ -1076,12 +1139,101 @@ mod tests {
         let mut state = state();
         state.requested_key = Some("NEW-2".to_owned());
         let action = state.apply_event(Event::Card(
+            0,
             "OLD-1".to_owned(),
             Box::new(Err("stale card error".to_owned())),
         ));
 
         assert!(action.is_none());
         assert_eq!(state.requested_key.as_deref(), Some("NEW-2"));
+    }
+
+    #[test]
+    fn stale_same_key_card_response_does_not_replace_newer_response() {
+        let mut state = state();
+        state.requested_key = Some("APP-1".to_owned());
+        state.card_generation = 2;
+
+        assert!(
+            state
+                .apply_event(Event::Card(
+                    2,
+                    "APP-1".to_owned(),
+                    Box::new(Ok(card("APP-1", "new", Vec::new()))),
+                ))
+                .is_none()
+        );
+        let action = state.apply_event(Event::Card(
+            1,
+            "APP-1".to_owned(),
+            Box::new(Ok(card("APP-1", "old", Vec::new()))),
+        ));
+
+        assert!(action.is_none());
+        assert_eq!(
+            state.card.as_ref().map(|card| card.summary.as_str()),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn stale_same_key_transition_response_does_not_replace_newer_response() {
+        let mut state = state();
+        state.card = Some(card("APP-1", "Issue", Vec::new()));
+        state.transition_generation = 2;
+        let new = jira_api::Transition {
+            id: "2".to_owned(),
+            name: "Finish".to_owned(),
+            to_status: "Done".to_owned(),
+        };
+        let old = jira_api::Transition {
+            id: "1".to_owned(),
+            name: "Start".to_owned(),
+            to_status: "In Progress".to_owned(),
+        };
+
+        assert!(
+            state
+                .apply_event(Event::Transitions(
+                    2,
+                    "APP-1".to_owned(),
+                    Ok(vec![new.clone()]),
+                ))
+                .is_none()
+        );
+        let action = state.apply_event(Event::Transitions(1, "APP-1".to_owned(), Ok(vec![old])));
+
+        assert!(action.is_none());
+        assert_eq!(state.transition_results, vec![new]);
+    }
+
+    #[test]
+    fn stale_same_key_comment_history_does_not_replace_newer_response() {
+        let mut state = state();
+        state.card = Some(card("APP-1", "Issue", Vec::new()));
+        state.more_comments_generation = 2;
+        let new = comment("new");
+
+        let new_action = state.apply_event(Event::MoreComments(
+            2,
+            "APP-1".to_owned(),
+            Ok(vec![new.clone()]),
+        ));
+        let stale_action = state.apply_event(Event::MoreComments(
+            1,
+            "APP-1".to_owned(),
+            Ok(vec![comment("old")]),
+        ));
+
+        assert_eq!(
+            new_action.and_then(|action| action.notice),
+            Some("Loaded comment history".to_owned())
+        );
+        assert!(stale_action.is_none());
+        assert_eq!(
+            state.card.as_ref().map(|card| card.comments.as_slice()),
+            Some([new].as_slice())
+        );
     }
 
     #[test]
