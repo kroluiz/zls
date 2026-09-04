@@ -45,7 +45,9 @@ Reload tmux with `tmux source-file ~/.tmux.conf`, then press prefix followed by 
 
 Press `?` in the popup to see every keybinding. The compact header and help overlay are generated from the same registry in `src/keybindings.rs`, which is the authoritative place for keybinding descriptions.
 
-Press `g` to inspect and edit the configuration currently loaded by ZLS, including the config and task-file paths, Jira site, account, Cloud ID, project, credential availability, and UI accent. Use the arrow keys to select the accent or Jira project and `Enter` to edit it. API tokens are never displayed.
+Press `g` to inspect and edit the configuration currently loaded by ZLS, including the config and task-file paths, Jira site, account, Cloud ID, project, credential availability, and UI accent. Use the arrow keys to select any row; `Enter` runs its action when the value is editable. API tokens are never displayed.
+
+Configuration tests the Jira connection automatically when opened and reuses that result for five minutes. Select `Test connection` and press `Enter` to refresh it immediately.
 
 The Accent row is editable. Press `Enter` to choose from 16 balanced and pastel presets with the arrow keys. The whole UI previews the highlighted color; `Enter` saves it, `Esc` restores the previous value, `c` accepts a custom strict `#RRGGBB` value, and `d` restores the default `#00FFFF` cyan. The accent only changes decorative elements; semantic status, warning, and error colors remain fixed.
 

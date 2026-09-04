@@ -7,7 +7,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -111,8 +111,9 @@ const ACCENT_PRESETS: &[AccentPreset] = &[
 
 const CONFIG_ACCENT: usize = 3;
 const CONFIG_PROJECT: usize = 4;
-const CONFIG_LAST_WITHOUT_JIRA: usize = CONFIG_PROJECT;
-const CONFIG_LAST_WITH_JIRA: usize = 9;
+const CONFIG_TEST_JIRA: usize = 10;
+const CONFIG_LAST_WITH_JIRA: usize = CONFIG_TEST_JIRA;
+const JIRA_CONNECTION_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -140,6 +141,14 @@ enum JiraEvent {
     Transitioned(String, Result<(), String>),
     Comment(String, Result<JiraComment, String>),
     MoreComments(String, Result<Vec<JiraComment>, String>),
+    Connection(u64, Instant, Result<String, String>),
+}
+
+enum JiraConnectionStatus {
+    NotChecked,
+    Checking,
+    Connected(String),
+    Failed(String),
 }
 
 struct State {
@@ -165,6 +174,9 @@ struct State {
     project_loading: bool,
     project_generation: u64,
     project_error: bool,
+    jira_connection_status: JiraConnectionStatus,
+    jira_connection_checked_at: Option<Instant>,
+    jira_connection_generation: u64,
     transition_results: Vec<Transition>,
     transition_selected: usize,
     transition_loading: bool,
@@ -211,6 +223,9 @@ impl Default for State {
             project_loading: false,
             project_generation: 0,
             project_error: false,
+            jira_connection_status: JiraConnectionStatus::NotChecked,
+            jira_connection_checked_at: None,
+            jira_connection_generation: 0,
             transition_results: Vec::new(),
             transition_selected: 0,
             transition_loading: false,
@@ -323,7 +338,13 @@ fn run_loop(
         if key.kind == KeyEventKind::Release {
             continue;
         }
-        if handle_global_overlay_key(key.code, &mut state) {
+        if handle_global_overlay_key(
+            key.code,
+            &mut state,
+            jira.as_ref(),
+            jira_error.as_deref(),
+            &sender,
+        ) {
             continue;
         }
 
@@ -643,7 +664,13 @@ fn handle_help_key(key: KeyCode, state: &mut State) {
     }
 }
 
-fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
+fn handle_global_overlay_key(
+    key: KeyCode,
+    state: &mut State,
+    jira: Option<&JiraClient>,
+    jira_error: Option<&str>,
+    sender: &Sender<JiraEvent>,
+) -> bool {
     match key {
         KeyCode::Char('?') if state.mode == Mode::Help => {
             state.mode = state.overlay_return;
@@ -668,6 +695,9 @@ fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
         KeyCode::Char('g') if state.mode == Mode::Normal => {
             state.config_selected = 0;
             state.mode = Mode::Configuration;
+            if jira_connection_test_due(state, Instant::now()) {
+                request_jira_connection_test(state, jira, jira_error, sender);
+            }
             true
         }
         _ => false,
@@ -686,12 +716,7 @@ fn handle_configuration_key(
             state.config_selected = state.config_selected.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let last = if state.jira_config.is_some() {
-                CONFIG_LAST_WITH_JIRA
-            } else {
-                CONFIG_LAST_WITHOUT_JIRA
-            };
-            state.config_selected = (state.config_selected + 1).min(last);
+            state.config_selected = (state.config_selected + 1).min(CONFIG_LAST_WITH_JIRA);
         }
         KeyCode::Enter => match state.config_selected {
             CONFIG_ACCENT => {
@@ -707,6 +732,9 @@ fn handle_configuration_key(
                 } else {
                     state.message = jira_error.unwrap_or("Jira is unavailable").to_owned();
                 }
+            }
+            CONFIG_TEST_JIRA => {
+                request_jira_connection_test(state, jira, jira_error, sender);
             }
             _ => state.message = "This configuration value is read-only".to_owned(),
         },
@@ -1127,6 +1155,47 @@ fn request_search(
     });
 }
 
+fn jira_connection_test_due(state: &State, now: Instant) -> bool {
+    !matches!(state.jira_connection_status, JiraConnectionStatus::Checking)
+        && state.jira_connection_checked_at.is_none_or(|checked_at| {
+            now.saturating_duration_since(checked_at) >= JIRA_CONNECTION_TTL
+        })
+}
+
+fn request_jira_connection_test(
+    state: &mut State,
+    jira: Option<&JiraClient>,
+    jira_error: Option<&str>,
+    sender: &Sender<JiraEvent>,
+) {
+    if matches!(state.jira_connection_status, JiraConnectionStatus::Checking) {
+        state.message = "Jira connection test is already running".to_owned();
+        return;
+    }
+    let Some(client) = jira else {
+        let error = jira_error
+            .unwrap_or("Jira is unavailable; check credentials and token")
+            .to_owned();
+        state.jira_connection_status = JiraConnectionStatus::Failed(error.clone());
+        state.jira_connection_checked_at = Some(Instant::now());
+        state.message = error;
+        return;
+    };
+    state.jira_connection_generation = state.jira_connection_generation.wrapping_add(1);
+    let generation = state.jira_connection_generation;
+    state.jira_connection_status = JiraConnectionStatus::Checking;
+    state.message = "Testing Jira connection...".to_owned();
+    let client = client.clone();
+    let sender = sender.clone();
+    thread::spawn(move || {
+        let result = client
+            .test_auth()
+            .map(|user| user.display_name)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(JiraEvent::Connection(generation, Instant::now(), result));
+    });
+}
+
 fn open_project_selector(state: &mut State, client: &JiraClient, sender: &Sender<JiraEvent>) {
     state.mode = Mode::Project;
     state.project_results.clear();
@@ -1253,6 +1322,22 @@ fn handle_jira_events(
                         state.message = "Loaded comment history".to_owned();
                     }
                     Err(error) => state.message = error,
+                }
+            }
+            JiraEvent::Connection(generation, checked_at, result)
+                if generation == state.jira_connection_generation =>
+            {
+                state.jira_connection_checked_at = Some(checked_at);
+                match result {
+                    Ok(display_name) => {
+                        state.message = format!("Jira connection verified as {display_name}");
+                        state.jira_connection_status =
+                            JiraConnectionStatus::Connected(display_name);
+                    }
+                    Err(error) => {
+                        state.message = error.clone();
+                        state.jira_connection_status = JiraConnectionStatus::Failed(error);
+                    }
                 }
             }
             _ => {}
@@ -1973,7 +2058,7 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" CONFIGURATION / arrows select / Enter edit / g, q, or Esc close ");
+        .title(" CONFIGURATION / arrows select / Enter action / g, q, or Esc close ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2008,69 +2093,105 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
         Line::raw(""),
         section_separator("JIRA", inner.width),
     ];
-    if let Some(config) = state.jira_config.as_ref() {
-        lines.extend([
-            selectable_detail_line(
-                "Project",
-                config.project.as_deref().unwrap_or("Not selected"),
-                state.config_selected == CONFIG_PROJECT,
-                state.accent,
-            ),
-            selectable_detail_line(
-                "Site",
-                &config.site,
-                state.config_selected == 5,
-                state.accent,
-            ),
-            selectable_detail_line(
-                "Email",
-                &config.email,
-                state.config_selected == 6,
-                state.accent,
-            ),
-            selectable_detail_line(
-                "Cloud ID",
-                &config.cloud_id,
-                state.config_selected == 7,
-                state.accent,
-            ),
-            selectable_detail_line(
-                "Auth",
-                if jira_error.is_none() {
-                    "Available"
-                } else {
-                    "Credential unavailable"
-                },
-                state.config_selected == 8,
-                state.accent,
-            ),
-            selectable_detail_line(
-                "API token",
-                "Hidden",
-                state.config_selected == 9,
-                state.accent,
-            ),
-        ]);
-        if let Some(error) = jira_error {
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(error, Style::default().fg(Color::Yellow)));
+    let config = state.jira_config.as_ref();
+    let connection = match &state.jira_connection_status {
+        JiraConnectionStatus::NotChecked if jira_error.is_some() || config.is_none() => {
+            "Unavailable".to_owned()
         }
-    } else {
-        lines.push(selectable_detail_line(
+        JiraConnectionStatus::NotChecked => "Not checked".to_owned(),
+        JiraConnectionStatus::Checking => "Checking...".to_owned(),
+        JiraConnectionStatus::Connected(display_name) => {
+            format!("Connected as {display_name}")
+        }
+        JiraConnectionStatus::Failed(_) => "Failed - Enter to retry".to_owned(),
+    };
+    lines.extend([
+        selectable_detail_line(
             "Project",
-            "Jira is not configured",
+            config
+                .and_then(|config| config.project.as_deref())
+                .unwrap_or("Not selected"),
             state.config_selected == CONFIG_PROJECT,
             state.accent,
-        ));
+        ),
+        selectable_detail_line(
+            "Site",
+            config.map_or("Not configured", |config| config.site.as_str()),
+            state.config_selected == 5,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "Email",
+            config.map_or("Not configured", |config| config.email.as_str()),
+            state.config_selected == 6,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "Cloud ID",
+            config.map_or("Not configured", |config| config.cloud_id.as_str()),
+            state.config_selected == 7,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "Credentials",
+            if jira_error.is_none() {
+                "Available"
+            } else {
+                "Unavailable"
+            },
+            state.config_selected == 8,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "API token",
+            "Hidden",
+            state.config_selected == 9,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "Test connection",
+            &connection,
+            state.config_selected == CONFIG_TEST_JIRA,
+            state.accent,
+        ),
+    ]);
+    let mut connection_error_lines = 0;
+    if let JiraConnectionStatus::Failed(error) = &state.jira_connection_status {
+        let wrapped = wrap_fixed_width(&format!("Error: {error}"), usize::from(inner.width.max(1)));
+        let max_lines = usize::from(inner.height.saturating_sub(1));
+        connection_error_lines = wrapped.len().min(max_lines);
+        lines.extend(
+            wrapped
+                .into_iter()
+                .take(max_lines)
+                .map(|line| Line::styled(line, Style::default().fg(Color::Yellow))),
+        );
     }
-
-    let selected_line = match state.config_selected {
+    let mut selected_line = match state.config_selected {
         0..=2 => state.config_selected + 1,
         CONFIG_ACCENT => 6,
         selected => selected + 5,
     } as u16;
+    if state.config_selected == CONFIG_TEST_JIRA && connection_error_lines > 0 {
+        selected_line = selected_line.saturating_add(connection_error_lines as u16);
+    }
     let scroll = selected_line.saturating_add(1).saturating_sub(inner.height);
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+}
+
+fn wrap_fixed_width(value: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for character in value.chars() {
+        if line.chars().count() == width {
+            lines.push(std::mem::take(&mut line));
+        }
+        line.push(character);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn draw_accent_palette(frame: &mut Frame, state: &State) {
@@ -2487,7 +2608,13 @@ mod tests {
             ..State::default()
         };
 
-        assert!(handle_global_overlay_key(KeyCode::Char('g'), &mut state));
+        assert!(handle_global_overlay_key(
+            KeyCode::Char('g'),
+            &mut state,
+            None,
+            None,
+            &sender
+        ));
         assert!(matches!(state.mode, Mode::Configuration));
         handle_configuration_key(KeyCode::Esc, &mut state, None, None, &sender);
 
@@ -2497,12 +2624,19 @@ mod tests {
 
     #[test]
     fn help_returns_to_the_overlay_that_opened_it() {
+        let (sender, _receiver) = mpsc::channel();
         let mut state = State {
             mode: Mode::Configuration,
             ..State::default()
         };
 
-        assert!(handle_global_overlay_key(KeyCode::Char('?'), &mut state));
+        assert!(handle_global_overlay_key(
+            KeyCode::Char('?'),
+            &mut state,
+            None,
+            None,
+            &sender
+        ));
         assert!(matches!(state.mode, Mode::Help));
         handle_help_key(KeyCode::Esc, &mut state);
 
@@ -2511,11 +2645,120 @@ mod tests {
 
     #[test]
     fn global_overlay_keys_do_not_capture_text_input() {
+        let (sender, _receiver) = mpsc::channel();
         let mut state = State {
             mode: Mode::Add,
             ..State::default()
         };
 
-        assert!(!handle_global_overlay_key(KeyCode::Char('?'), &mut state));
+        assert!(!handle_global_overlay_key(
+            KeyCode::Char('?'),
+            &mut state,
+            None,
+            None,
+            &sender
+        ));
+    }
+
+    #[test]
+    fn jira_connection_result_expires_after_five_minutes() {
+        let checked_at = Instant::now();
+        let state = State {
+            jira_connection_status: JiraConnectionStatus::Connected("User".to_owned()),
+            jira_connection_checked_at: Some(checked_at),
+            ..State::default()
+        };
+
+        assert!(!jira_connection_test_due(
+            &state,
+            checked_at + JIRA_CONNECTION_TTL - Duration::from_secs(1)
+        ));
+        assert!(jira_connection_test_due(
+            &state,
+            checked_at + JIRA_CONNECTION_TTL
+        ));
+    }
+
+    #[test]
+    fn jira_connection_row_is_visible_when_selected() -> Result<()> {
+        let backend = ratatui::backend::TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend)?;
+        let state = State {
+            config_selected: CONFIG_TEST_JIRA,
+            jira_connection_status: JiraConnectionStatus::Connected("Test User".to_owned()),
+            ..State::default()
+        };
+
+        terminal.draw(|frame| draw_configuration(frame, &state, None))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Test connection"));
+        assert!(rendered.contains("Connected as Test User"));
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_jira_result_is_cached() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = State::default();
+
+        request_jira_connection_test(&mut state, None, Some("missing Jira token"), &sender);
+
+        let checked_at = state.jira_connection_checked_at.unwrap();
+        assert!(matches!(
+            state.jira_connection_status,
+            JiraConnectionStatus::Failed(ref error) if error == "missing Jira token"
+        ));
+        assert!(!jira_connection_test_due(
+            &state,
+            checked_at + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn repeated_jira_connection_test_is_ignored_while_checking() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = State {
+            jira_connection_status: JiraConnectionStatus::Checking,
+            jira_connection_generation: 4,
+            ..State::default()
+        };
+
+        request_jira_connection_test(&mut state, None, Some("unavailable"), &sender);
+
+        assert_eq!(state.jira_connection_generation, 4);
+        assert_eq!(state.message, "Jira connection test is already running");
+    }
+
+    #[test]
+    fn jira_connection_error_is_visible_in_a_short_popup() -> Result<()> {
+        let backend = ratatui::backend::TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend)?;
+        let state = State {
+            config_selected: CONFIG_TEST_JIRA,
+            jira_connection_status: JiraConnectionStatus::Failed(
+                "Jira authentication failed because the API token was rejected".to_owned(),
+            ),
+            ..State::default()
+        };
+
+        terminal.draw(|frame| draw_configuration(frame, &state, Some("authentication failed")))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Test connection"));
+        assert!(rendered.contains("Error: Jira authentication failed"));
+        Ok(())
     }
 }
