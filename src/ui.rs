@@ -109,6 +109,11 @@ const ACCENT_PRESETS: &[AccentPreset] = &[
     },
 ];
 
+const CONFIG_ACCENT: usize = 3;
+const CONFIG_PROJECT: usize = 4;
+const CONFIG_LAST_WITHOUT_JIRA: usize = CONFIG_PROJECT;
+const CONFIG_LAST_WITH_JIRA: usize = 9;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -681,23 +686,29 @@ fn handle_configuration_key(
             state.config_selected = state.config_selected.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            state.config_selected = (state.config_selected + 1).min(1);
+            let last = if state.jira_config.is_some() {
+                CONFIG_LAST_WITH_JIRA
+            } else {
+                CONFIG_LAST_WITHOUT_JIRA
+            };
+            state.config_selected = (state.config_selected + 1).min(last);
         }
         KeyCode::Enter => match state.config_selected {
-            0 => {
+            CONFIG_ACCENT => {
                 state.accent_original = state.accent_hex.clone();
                 state.accent_selected = ACCENT_PRESETS
                     .iter()
                     .position(|preset| preset.hex.eq_ignore_ascii_case(&state.accent_hex));
                 state.mode = Mode::AccentPalette;
             }
-            _ => {
+            CONFIG_PROJECT => {
                 if let Some(client) = jira {
                     open_project_selector(state, client, sender);
                 } else {
                     state.message = jira_error.unwrap_or("Jira is unavailable").to_owned();
                 }
             }
+            _ => state.message = "This configuration value is read-only".to_owned(),
         },
         KeyCode::Char('g' | 'q') | KeyCode::Esc => state.mode = Mode::Normal,
         _ => {}
@@ -1777,7 +1788,7 @@ fn selectable_detail_line(
 ) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{} {label:<10}", if selected { ">" } else { " " }),
+            format!("{}{label:<12}", if selected { "> " } else { "  " }),
             Style::default().fg(if selected { accent } else { Color::DarkGray }),
         ),
         Span::styled(
@@ -1968,31 +1979,32 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
 
     let mut lines = vec![
         section_separator("ZLS", inner.width),
-        detail_line("Config file", &state.config_path),
-        detail_line("Tasks file", &state.task_path),
-        detail_line("Docs path", &state.docs_path),
+        selectable_detail_line(
+            "Config file",
+            &state.config_path,
+            state.config_selected == 0,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "Tasks file",
+            &state.task_path,
+            state.config_selected == 1,
+            state.accent,
+        ),
+        selectable_detail_line(
+            "Docs path",
+            &state.docs_path,
+            state.config_selected == 2,
+            state.accent,
+        ),
         Line::raw(""),
         section_separator("APPEARANCE", inner.width),
-        Line::from(vec![
-            Span::styled(
-                format!(
-                    "{} {:<10}",
-                    if state.config_selected == 0 { ">" } else { " " },
-                    "Accent"
-                ),
-                Style::default()
-                    .fg(state.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{}  Enter to edit", state.accent_hex),
-                Style::default().add_modifier(if state.config_selected == 0 {
-                    Modifier::REVERSED
-                } else {
-                    Modifier::empty()
-                }),
-            ),
-        ]),
+        selectable_detail_line(
+            "Accent",
+            &state.accent_hex,
+            state.config_selected == CONFIG_ACCENT,
+            state.accent,
+        ),
         Line::raw(""),
         section_separator("JIRA", inner.width),
     ];
@@ -2001,21 +2013,43 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
             selectable_detail_line(
                 "Project",
                 config.project.as_deref().unwrap_or("Not selected"),
-                state.config_selected == 1,
+                state.config_selected == CONFIG_PROJECT,
                 state.accent,
             ),
-            detail_line("Site", &config.site),
-            detail_line("Email", &config.email),
-            detail_line("Cloud ID", &config.cloud_id),
-            detail_line(
+            selectable_detail_line(
+                "Site",
+                &config.site,
+                state.config_selected == 5,
+                state.accent,
+            ),
+            selectable_detail_line(
+                "Email",
+                &config.email,
+                state.config_selected == 6,
+                state.accent,
+            ),
+            selectable_detail_line(
+                "Cloud ID",
+                &config.cloud_id,
+                state.config_selected == 7,
+                state.accent,
+            ),
+            selectable_detail_line(
                 "Auth",
                 if jira_error.is_none() {
                     "Available"
                 } else {
                     "Credential unavailable"
                 },
+                state.config_selected == 8,
+                state.accent,
             ),
-            detail_line("API token", "Hidden"),
+            selectable_detail_line(
+                "API token",
+                "Hidden",
+                state.config_selected == 9,
+                state.accent,
+            ),
         ]);
         if let Some(error) = jira_error {
             lines.push(Line::raw(""));
@@ -2025,12 +2059,18 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
         lines.push(selectable_detail_line(
             "Project",
             "Jira is not configured",
-            state.config_selected == 1,
+            state.config_selected == CONFIG_PROJECT,
             state.accent,
         ));
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    let selected_line = match state.config_selected {
+        0..=2 => state.config_selected + 1,
+        CONFIG_ACCENT => 6,
+        selected => selected + 5,
+    } as u16;
+    let scroll = selected_line.saturating_add(1).saturating_sub(inner.height);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 }
 
 fn draw_accent_palette(frame: &mut Frame, state: &State) {
@@ -2343,19 +2383,37 @@ mod tests {
     }
 
     #[test]
-    fn configuration_navigates_between_accent_and_jira_project() {
+    fn every_configuration_row_is_selectable() {
         let (sender, _receiver) = mpsc::channel();
         let mut state = State {
             mode: Mode::Configuration,
+            jira_config: Some(JiraConfig {
+                site: "https://example.atlassian.net".to_owned(),
+                email: "user@example.com".to_owned(),
+                cloud_id: "cloud-id".to_owned(),
+                project: Some("OBS".to_owned()),
+            }),
             ..State::default()
         };
 
+        for expected in 1..=CONFIG_LAST_WITH_JIRA {
+            handle_configuration_key(KeyCode::Down, &mut state, None, None, &sender);
+            assert_eq!(state.config_selected, expected);
+        }
         handle_configuration_key(KeyCode::Down, &mut state, None, None, &sender);
-        assert_eq!(state.config_selected, 1);
-        handle_configuration_key(KeyCode::Down, &mut state, None, None, &sender);
-        assert_eq!(state.config_selected, 1);
+        assert_eq!(state.config_selected, CONFIG_LAST_WITH_JIRA);
         handle_configuration_key(KeyCode::Up, &mut state, None, None, &sender);
-        assert_eq!(state.config_selected, 0);
+        assert_eq!(state.config_selected, CONFIG_LAST_WITH_JIRA - 1);
+    }
+
+    #[test]
+    fn unselected_accent_uses_the_same_style_as_unselected_project() {
+        let accent = selectable_detail_line("Accent", "#00FFFF", false, Color::Cyan);
+        let project = selectable_detail_line("Project", "OBS", false, Color::Cyan);
+
+        assert_eq!(accent.spans[0].style, project.spans[0].style);
+        assert_eq!(accent.spans[1].style, project.spans[1].style);
+        assert!(!accent.spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -2376,7 +2434,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(60, 16);
         let mut terminal = Terminal::new(backend)?;
         let state = State {
-            config_selected: 1,
+            config_selected: CONFIG_PROJECT,
             config_path: "/home/user/a/very/long/configuration/path/zls/config.toml".to_owned(),
             task_path: "/home/user/a/very/long/task/storage/path/todo.md".to_owned(),
             docs_path: "/home/user/a/very/long/documentation/storage/path".to_owned(),
