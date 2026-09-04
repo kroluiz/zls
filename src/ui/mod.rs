@@ -5,6 +5,7 @@ use std::{
 };
 
 mod configuration;
+mod help;
 mod jira;
 mod layout;
 mod tasks;
@@ -21,18 +22,16 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    text::Line,
+    widgets::Paragraph,
 };
 
 use crate::{
     config::{AppConfig, config_path},
     docs,
-    keybindings::{KEYBINDINGS, Section, compact_hint},
+    keybindings::compact_hint,
     store::{Entry, Store, WeekReport},
 };
-
-use self::layout::centered;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -54,7 +53,7 @@ struct State {
     overlay_return: Mode,
     message: String,
     jira: jira::State,
-    help_scroll: u16,
+    help: help::State,
     configuration: configuration::State,
     edit_document: bool,
     tasks: tasks::State,
@@ -69,7 +68,7 @@ impl State {
             overlay_return: Mode::Normal,
             message: String::new(),
             jira,
-            help_scroll: 0,
+            help: help::State::default(),
             configuration,
             edit_document: false,
             tasks: tasks::State::default(),
@@ -164,7 +163,10 @@ fn run_loop(
         }
 
         match state.mode {
-            Mode::Help => handle_help_key(key.code, &mut state),
+            Mode::Help => {
+                let action = state.help.handle_key(key.code);
+                apply_help_action(action, &mut state);
+            }
             Mode::Configuration => apply_configuration_action(
                 configuration::State::handle_overview(
                     &mut state.configuration,
@@ -294,25 +296,17 @@ fn apply_week_action(action: week::Action, state: &mut State) -> bool {
     false
 }
 
-fn handle_help_key(key: KeyCode, state: &mut State) {
-    match key {
-        KeyCode::Char('q') | KeyCode::Esc => state.mode = state.overlay_return,
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.help_scroll = state.help_scroll.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.help_scroll = state.help_scroll.saturating_add(1);
-        }
-        KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(8),
-        KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(8),
-        _ => {}
+fn apply_help_action(action: help::Action, state: &mut State) {
+    if action == help::Action::Close {
+        state.mode = state.overlay_return;
     }
 }
 
 fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
     match key {
         KeyCode::Char('?') if state.mode == Mode::Help => {
-            state.mode = state.overlay_return;
+            let action = state.help.handle_key(key);
+            apply_help_action(action, state);
             true
         }
         KeyCode::Char('?')
@@ -325,7 +319,7 @@ fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
                 return false;
             }
             state.overlay_return = state.mode;
-            state.help_scroll = 0;
+            state.help.open();
             state.mode = Mode::Help;
             true
         }
@@ -508,7 +502,7 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
     );
 
     match state.mode {
-        Mode::Help => draw_help(frame, state),
+        Mode::Help => state.help.draw(frame, state.configuration.accent()),
         Mode::Configuration => {
             configuration::draw_overview(frame, &state.configuration, state.jira.startup_error())
         }
@@ -540,54 +534,6 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
             Line::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         ]),
         area,
-    );
-}
-
-fn draw_help(frame: &mut Frame, state: &State) {
-    let area = centered(frame.area(), 74, 86);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" KEYBINDINGS / j-k scroll / ? or Esc close ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines = Vec::new();
-    for section in [
-        Section::Tasks,
-        Section::Jira,
-        Section::Configuration,
-        Section::Navigation,
-        Section::Dialogs,
-    ] {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
-        lines.push(Line::styled(
-            section.title(),
-            Style::default()
-                .fg(state.configuration.accent())
-                .add_modifier(Modifier::BOLD),
-        ));
-        for binding in KEYBINDINGS
-            .iter()
-            .filter(|binding| binding.section == section)
-        {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:<16}", binding.keys),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(binding.description),
-            ]));
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((state.help_scroll, 0)),
-        inner,
     );
 }
 
@@ -646,7 +592,7 @@ mod tests {
 
         assert!(handle_global_overlay_key(KeyCode::Char('?'), &mut state));
         assert!(matches!(state.mode, Mode::Help));
-        handle_help_key(KeyCode::Esc, &mut state);
+        assert!(handle_global_overlay_key(KeyCode::Char('?'), &mut state));
 
         assert!(matches!(state.mode, Mode::Configuration));
     }
