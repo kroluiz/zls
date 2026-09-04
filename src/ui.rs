@@ -109,6 +109,7 @@ const ACCENT_PRESETS: &[AccentPreset] = &[
     },
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
     Add,
@@ -142,6 +143,7 @@ struct State {
     show_backlog: bool,
     jira_tab: bool,
     mode: Mode,
+    overlay_return: Mode,
     input: String,
     message: String,
     card: Option<IssueCard>,
@@ -187,6 +189,7 @@ impl Default for State {
             show_backlog: false,
             jira_tab: false,
             mode: Mode::Normal,
+            overlay_return: Mode::Normal,
             input: String::new(),
             message: String::new(),
             card: None,
@@ -315,6 +318,9 @@ fn run_loop(
         if key.kind == KeyEventKind::Release {
             continue;
         }
+        if handle_global_overlay_key(key.code, &mut state) {
+            continue;
+        }
 
         match state.mode {
             Mode::Add => handle_add_key(key.code, &mut state, store, false)?,
@@ -386,14 +392,6 @@ fn handle_normal_key(
             state.selected = 0;
         }
         KeyCode::Esc => return Ok(true),
-        KeyCode::Char('?') => {
-            state.mode = Mode::Help;
-            state.help_scroll = 0;
-        }
-        KeyCode::Char('g') => {
-            state.config_selected = 0;
-            state.mode = Mode::Configuration;
-        }
         KeyCode::Char('W') => {
             state.weekly = true;
             state.weeks_ago = 0;
@@ -530,10 +528,6 @@ fn handle_week_key(key: KeyCode, entries: &[Entry], state: &mut State) -> Result
             state.selected = 0;
             state.jira_tab = false;
         }
-        KeyCode::Char('?') => {
-            state.mode = Mode::Help;
-            state.help_scroll = 0;
-        }
         KeyCode::Left => {
             state.weeks_ago = state.weeks_ago.saturating_add(1);
             state.selected = 0;
@@ -631,7 +625,7 @@ fn handle_move_key(
 
 fn handle_help_key(key: KeyCode, state: &mut State) {
     match key {
-        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => state.mode = Mode::Normal,
+        KeyCode::Char('q') | KeyCode::Esc => state.mode = state.overlay_return,
         KeyCode::Up | KeyCode::Char('k') => {
             state.help_scroll = state.help_scroll.saturating_sub(1);
         }
@@ -641,6 +635,37 @@ fn handle_help_key(key: KeyCode, state: &mut State) {
         KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(8),
         KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(8),
         _ => {}
+    }
+}
+
+fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
+    match key {
+        KeyCode::Char('?') if state.mode == Mode::Help => {
+            state.mode = state.overlay_return;
+            true
+        }
+        KeyCode::Char('?')
+            if !matches!(
+                state.mode,
+                Mode::Add
+                    | Mode::AddBacklog
+                    | Mode::AccentCustom
+                    | Mode::TaskSearch
+                    | Mode::Search
+                    | Mode::Comment
+            ) =>
+        {
+            state.overlay_return = state.mode;
+            state.help_scroll = 0;
+            state.mode = Mode::Help;
+            true
+        }
+        KeyCode::Char('g') if state.mode == Mode::Normal => {
+            state.config_selected = 0;
+            state.mode = Mode::Configuration;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2393,5 +2418,46 @@ mod tests {
         handle_jira_events(&mut state, &receiver, &sender, None);
 
         assert_eq!(state.message, "Current message");
+    }
+
+    #[test]
+    fn configuration_opens_and_closes_without_leaving_week_view() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = State {
+            weekly: true,
+            mode: Mode::Normal,
+            ..State::default()
+        };
+
+        assert!(handle_global_overlay_key(KeyCode::Char('g'), &mut state));
+        assert!(matches!(state.mode, Mode::Configuration));
+        handle_configuration_key(KeyCode::Esc, &mut state, None, None, &sender);
+
+        assert!(matches!(state.mode, Mode::Normal));
+        assert!(state.weekly);
+    }
+
+    #[test]
+    fn help_returns_to_the_overlay_that_opened_it() {
+        let mut state = State {
+            mode: Mode::Configuration,
+            ..State::default()
+        };
+
+        assert!(handle_global_overlay_key(KeyCode::Char('?'), &mut state));
+        assert!(matches!(state.mode, Mode::Help));
+        handle_help_key(KeyCode::Esc, &mut state);
+
+        assert!(matches!(state.mode, Mode::Configuration));
+    }
+
+    #[test]
+    fn global_overlay_keys_do_not_capture_text_input() {
+        let mut state = State {
+            mode: Mode::Add,
+            ..State::default()
+        };
+
+        assert!(!handle_global_overlay_key(KeyCode::Char('?'), &mut state));
     }
 }
