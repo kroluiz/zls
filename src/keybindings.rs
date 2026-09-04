@@ -136,12 +136,6 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact: false,
     },
     Keybinding {
-        keys: "s",
-        description: "select the configured Jira project",
-        section: Section::Jira,
-        compact: false,
-    },
-    Keybinding {
         keys: "t",
         description: "change the linked Jira issue status",
         section: Section::Jira,
@@ -167,7 +161,7 @@ pub const KEYBINDINGS: &[Keybinding] = &[
     },
     Keybinding {
         keys: "g",
-        description: "show the loaded ZLS configuration",
+        description: "show and edit the loaded ZLS configuration",
         section: Section::Configuration,
         compact: false,
     },
@@ -230,6 +224,7 @@ mod tests {
                 .all(|binding| !binding.keys.is_empty() && !binding.description.is_empty())
         );
         assert!(KEYBINDINGS.iter().any(|binding| binding.keys == "?"));
+        assert!(!KEYBINDINGS.iter().any(|binding| binding.keys == "s"));
         assert!(compact_hint().contains("? show"));
         for section in [
             Section::Tasks,

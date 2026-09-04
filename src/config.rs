@@ -7,11 +7,15 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
+use toml_edit::{DocumentMut, Item, Table, Value, value};
+
+pub const DEFAULT_ACCENT: &str = "#00FFFF";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub tasks: TasksConfig,
     pub docs: DocsConfig,
+    pub ui: UiConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -22,6 +26,19 @@ pub struct TasksConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DocsConfig {
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UiConfig {
+    pub accent: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            accent: DEFAULT_ACCENT.to_owned(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -47,51 +64,77 @@ impl AppConfig {
         )?;
         let needs_tasks = existing.tasks.is_none();
         let needs_docs = existing.docs.is_none();
+        let needs_ui = existing
+            .ui
+            .as_ref()
+            .and_then(|ui| ui.accent.as_ref())
+            .is_none();
         let tasks = existing.tasks.unwrap_or(TasksConfig {
             path: default_task_path,
         });
         let docs = existing.docs.unwrap_or(DocsConfig {
             path: default_docs_path,
         });
+        let ui = UiConfig {
+            accent: existing
+                .ui
+                .and_then(|ui| ui.accent)
+                .unwrap_or_else(|| DEFAULT_ACCENT.to_owned()),
+        };
         if tasks.path.as_os_str().is_empty() {
             bail!("tasks.path must not be empty in {}", path.display());
         }
         if docs.path.as_os_str().is_empty() {
             bail!("docs.path must not be empty in {}", path.display());
         }
+        parse_hex_color(&ui.accent).with_context(|| "invalid ui.accent")?;
 
-        if needs_tasks || needs_docs {
+        if needs_tasks || needs_docs || needs_ui {
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
-            let mut updated = contents.unwrap_or_default();
-            if !updated.is_empty() && !updated.ends_with('\n') {
-                updated.push('\n');
-            }
-            if !updated.trim().is_empty() {
-                updated.push('\n');
-            }
+            let mut document = contents
+                .as_deref()
+                .unwrap_or_default()
+                .parse::<DocumentMut>()
+                .with_context(|| format!("invalid TOML in {}", path.display()))?;
             if needs_tasks {
-                updated.push_str("[tasks]\n");
-                updated.push_str(&toml::to_string(&tasks)?);
-                updated.push('\n');
+                ensure_table(&mut document, "tasks");
+                document["tasks"]["path"] = value(tasks.path.to_string_lossy().as_ref());
             }
             if needs_docs {
-                updated.push_str("[docs]\n");
-                updated.push_str(&toml::to_string(&docs)?);
+                ensure_table(&mut document, "docs");
+                document["docs"]["path"] = value(docs.path.to_string_lossy().as_ref());
             }
-            let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
-                format!("failed to create temporary file in {}", parent.display())
-            })?;
-            temporary.write_all(updated.as_bytes())?;
-            temporary.flush()?;
-            temporary
-                .persist(path)
-                .map_err(|error| error.error)
-                .with_context(|| format!("failed to replace {}", path.display()))?;
+            if needs_ui {
+                ensure_table(&mut document, "ui");
+                document["ui"]["accent"] = value(&ui.accent);
+            }
+            write_atomic(path, document.to_string().as_bytes())?;
         }
 
-        Ok(Self { tasks, docs })
+        Ok(Self { tasks, docs, ui })
+    }
+
+    pub fn set_accent(&mut self, accent: &str) -> Result<()> {
+        self.set_accent_at(&config_path()?, accent)
+    }
+
+    fn set_accent_at(&mut self, path: &Path, accent: &str) -> Result<()> {
+        parse_hex_color(accent)?;
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config at {}", path.display()))?;
+        let mut document = contents
+            .parse::<DocumentMut>()
+            .with_context(|| format!("invalid TOML in {}", path.display()))?;
+        let mut accent_value = Value::from(accent);
+        if let Some(existing) = document["ui"]["accent"].as_value() {
+            *accent_value.decor_mut() = existing.decor().clone();
+        }
+        document["ui"]["accent"] = Item::Value(accent_value);
+        write_atomic(path, document.to_string().as_bytes())?;
+        self.ui.accent = accent.to_owned();
+        Ok(())
     }
 }
 
@@ -99,6 +142,57 @@ impl AppConfig {
 struct ConfigFile {
     tasks: Option<TasksConfig>,
     docs: Option<DocsConfig>,
+    ui: Option<RawUiConfig>,
+}
+
+#[derive(Deserialize)]
+struct RawUiConfig {
+    accent: Option<String>,
+}
+
+fn ensure_table(document: &mut DocumentMut, name: &str) {
+    if !document.as_table().contains_key(name) {
+        document[name] = Item::Table(Table::new());
+    }
+}
+
+pub fn parse_hex_color(value: &str) -> Result<(u8, u8, u8)> {
+    if value.len() != 7
+        || !value.starts_with('#')
+        || !value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("accent must use #RRGGBB format, got {value:?}");
+    }
+    Ok((
+        u8::from_str_radix(&value[1..3], 16)?,
+        u8::from_str_radix(&value[3..5], 16)?,
+        u8::from_str_radix(&value[5..7], 16)?,
+    ))
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let destination = if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()) {
+        fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve config symlink {}", path.display()))?
+    } else {
+        path.to_owned()
+    };
+    let permissions = fs::metadata(&destination)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    temporary.write_all(contents)?;
+    temporary.flush()?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error)
+        .map(|_| ())
+        .with_context(|| format!("failed to replace {}", destination.display()))
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -142,10 +236,12 @@ mod tests {
 
         assert_eq!(config.tasks.path, tasks_path);
         assert_eq!(config.docs.path, docs_path);
+        assert_eq!(config.ui.accent, DEFAULT_ACCENT);
         assert!(saved.contains("[jira]"));
         assert!(saved.contains("# preserve this comment"));
         assert!(saved.contains("[tasks]"));
         assert!(saved.contains("[docs]"));
+        assert!(saved.contains("[ui]"));
         Ok(())
     }
 
@@ -166,6 +262,84 @@ mod tests {
         )?;
 
         assert_eq!(config.tasks.path, configured);
+        Ok(())
+    }
+
+    #[test]
+    fn adds_accent_to_an_existing_ui_table() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "[tasks]\npath = \"todo.md\"\n[docs]\npath = \"docs\"\n[ui]\n# future settings live here\n",
+        )?;
+
+        let config = AppConfig::load_or_create_at(
+            &path,
+            directory.path().join("default.md"),
+            directory.path().join("default-docs"),
+        )?;
+        let saved = fs::read_to_string(path)?;
+
+        assert_eq!(config.ui.accent, DEFAULT_ACCENT);
+        assert!(saved.contains("# future settings live here"));
+        assert!(saved.contains("accent = \"#00FFFF\""));
+        Ok(())
+    }
+
+    #[test]
+    fn validates_and_updates_accent_without_losing_comments() -> Result<()> {
+        assert_eq!(parse_hex_color("#00FFFF")?, (0, 255, 255));
+        assert!(parse_hex_color("00FFFF").is_err());
+        assert!(parse_hex_color("#0FF").is_err());
+        assert!(parse_hex_color("#GGFFFF").is_err());
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "# keep me\n[tasks]\npath = \"todo.md\"\n[docs]\npath = \"docs\"\n[ui]\naccent = \"#00FFFF\" # accent comment\n",
+        )?;
+        let mut config = AppConfig::load_or_create_at(
+            &path,
+            directory.path().join("default.md"),
+            directory.path().join("default-docs"),
+        )?;
+
+        config.set_accent_at(&path, "#89B4FA")?;
+        let saved = fs::read_to_string(path)?;
+        assert_eq!(config.ui.accent, "#89B4FA");
+        assert!(saved.contains("# keep me"));
+        assert!(saved.contains("# accent comment"));
+        assert!(saved.contains("accent = \"#89B4FA\""));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accent_updates_follow_symlinks_and_preserve_permissions() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("managed.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(
+            &target,
+            "[tasks]\npath = \"todo.md\"\n[docs]\npath = \"docs\"\n[ui]\naccent = \"#00FFFF\"\n",
+        )?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))?;
+        symlink(&target, &link)?;
+        let mut config = AppConfig::load_or_create_at(
+            &link,
+            directory.path().join("default.md"),
+            directory.path().join("default-docs"),
+        )?;
+
+        config.set_accent_at(&link, "#CBA6F7")?;
+
+        assert!(fs::symlink_metadata(&link)?.is_symlink());
+        assert!(fs::read_to_string(target)?.contains("#CBA6F7"));
+        assert_eq!(fs::metadata(link)?.permissions().mode() & 0o777, 0o640);
         Ok(())
     }
 }

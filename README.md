@@ -10,6 +10,9 @@ path = "/home/luiz/Documents/notes/appoena/todo.md"
 
 [docs]
 path = "/home/luiz/.local/share/zls/docs"
+
+[ui]
+accent = "#00FFFF"
 ```
 
 Edit these paths to move the task store or documentation directory. `ZLS_FILE` and `--file` remain available as temporary task-file overrides.
@@ -42,7 +45,9 @@ Reload tmux with `tmux source-file ~/.tmux.conf`, then press prefix followed by 
 
 Press `?` in the popup to see every keybinding. The compact header and help overlay are generated from the same registry in `src/keybindings.rs`, which is the authoritative place for keybinding descriptions.
 
-Press `g` to inspect the configuration currently loaded by ZLS, including the config and task-file paths, Jira site, account, Cloud ID, project, and credential availability. API tokens are never displayed.
+Press `g` to inspect and edit the configuration currently loaded by ZLS, including the config and task-file paths, Jira site, account, Cloud ID, project, credential availability, and UI accent. Use the arrow keys to select the accent or Jira project and `Enter` to edit it. API tokens are never displayed.
+
+The Accent row is editable. Press `Enter` to choose from 16 balanced and pastel presets with the arrow keys. The whole UI previews the highlighted color; `Enter` saves it, `Esc` restores the previous value, `c` accepts a custom strict `#RRGGBB` value, and `d` restores the default `#00FFFF` cyan. The accent only changes decorative elements; semantic status, warning, and error colors remain fixed.
 
 Press `/` to filter visible tasks in real time by text, Jira key, date, or task ID. `Enter` keeps the filtered view so task actions apply to those results; `Esc` clears the filter.
 
@@ -50,7 +55,7 @@ Press `e` to create or edit documentation for the selected task in `$VISUAL`, fa
 
 Press `W` for the weekly retrospective. It groups completed tasks by their completion timestamp across the current ISO week. Use `Left` and `Right` to move through current and previous weeks, `0` to return to the current week, and `Esc` to return to the task list. Tasks remain selectable for Jira inspection and documentation editing.
 
-The Jira card opens on the right for the selected linked task. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Press `s` to select the one Jira project ZLS will use; the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
+The Jira card opens on the right for the selected linked task. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Select the Jira project from Configuration (`g`); the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
 
 When the popup opens, unfinished tasks from previous days are automatically carried into today. Completed tasks remain under their original date in history. The operation is idempotent, so reopening the popup does not duplicate or rewrite already-carried tasks.
 
@@ -129,7 +134,7 @@ Configure and verify your account:
 ./target/release/zls jira test
 ```
 
-Open the popup and press `s` to choose your project from the projects visible to your Jira account. You can also configure it through the CLI:
+Open Configuration with `g`, select `Project` under Jira, and press `Enter` to choose from the projects visible to your Jira account. You can also configure it through the CLI:
 
 ```console
 ./target/release/zls jira projects

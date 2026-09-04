@@ -343,15 +343,15 @@ fn print_task_context(context: &TaskContext, format: ContextFormat) -> Result<()
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = AppConfig::load_or_create(initial_task_file()?)?;
+    let mut config = AppConfig::load_or_create(initial_task_file()?)?;
     let docs_path = expand_home(config.docs.path.clone());
     let file = cli
         .file
         .or_else(|| env::var_os("ZLS_FILE").map(PathBuf::from))
-        .unwrap_or(config.tasks.path);
+        .unwrap_or_else(|| config.tasks.path.clone());
     let mut store = Store::load(expand_home(file))?;
     match cli.command.unwrap_or(Action::Ui) {
-        Action::Ui => ui::run(&mut store, &docs_path),
+        Action::Ui => ui::run(&mut store, &docs_path, &mut config),
         Action::Popup => {
             if env::var_os("TMUX").is_none() {
                 bail!("popup must be run inside tmux");
