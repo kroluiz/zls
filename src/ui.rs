@@ -1873,7 +1873,7 @@ fn selectable_detail_line(
 ) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{}{label:<12}", if selected { "> " } else { "  " }),
+            format!("{}{label:<12} ", if selected { "> " } else { "  " }),
             Style::default().fg(if selected { accent } else { Color::DarkGray }),
         ),
         Span::styled(
@@ -2149,7 +2149,7 @@ fn draw_configuration(frame: &mut Frame, state: &State, jira_error: Option<&str>
             state.accent,
         ),
         selectable_detail_line(
-            "Test connection",
+            "Status",
             &connection,
             state.config_selected == CONFIG_TEST_JIRA,
             state.accent,
@@ -2698,7 +2698,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Test connection"));
+        assert!(rendered.contains("Status"));
         assert!(rendered.contains("Connected as Test User"));
         Ok(())
     }
@@ -2757,7 +2757,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Test connection"));
+        assert!(rendered.contains("Status"));
         assert!(rendered.contains("Error: Jira authentication failed"));
         Ok(())
     }
