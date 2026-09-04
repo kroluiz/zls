@@ -1,28 +1,23 @@
 use std::{
     io::{self, stdout},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
-    thread,
     time::Duration,
 };
 
 mod configuration;
+mod jira;
 
 use anyhow::Result;
 use chrono::NaiveDate;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -31,10 +26,6 @@ use ratatui::{
 use crate::{
     config::{AppConfig, config_path},
     docs,
-    jira::{
-        IssueCard, IssueSummary, JiraClient, JiraComment, JiraConfig, ProjectSummary, Transition,
-        format_jira_datetime,
-    },
     keybindings::{KEYBINDINGS, Section, compact_hint},
     store::{BACKLOG, Entry, Store, WeekReport, today, tomorrow},
 };
@@ -57,16 +48,6 @@ enum Mode {
     ConfirmComment,
 }
 
-enum JiraEvent {
-    Card(String, Box<Result<IssueCard, String>>),
-    Search(u64, Result<Vec<IssueSummary>, String>),
-    Projects(u64, Result<Vec<ProjectSummary>, String>),
-    Transitions(String, Result<Vec<Transition>, String>),
-    Transitioned(String, Result<(), String>),
-    Comment(String, Result<JiraComment, String>),
-    MoreComments(String, Result<Vec<JiraComment>, String>),
-}
-
 struct State {
     selected: usize,
     show_history: bool,
@@ -76,23 +57,7 @@ struct State {
     overlay_return: Mode,
     input: String,
     message: String,
-    card: Option<IssueCard>,
-    requested_key: Option<String>,
-    card_loading: bool,
-    card_scroll: u16,
-    search_results: Vec<IssueSummary>,
-    search_selected: usize,
-    search_generation: u64,
-    search_token: Arc<AtomicU64>,
-    search_loading: bool,
-    project_results: Vec<ProjectSummary>,
-    project_selected: usize,
-    project_loading: bool,
-    project_generation: u64,
-    project_error: bool,
-    transition_results: Vec<Transition>,
-    transition_selected: usize,
-    transition_loading: bool,
+    jira: jira::State,
     move_selected: usize,
     help_scroll: u16,
     configuration: configuration::State,
@@ -103,7 +68,7 @@ struct State {
 }
 
 impl State {
-    fn new(configuration: configuration::State) -> Self {
+    fn new(configuration: configuration::State, jira: jira::State) -> Self {
         Self {
             selected: 0,
             show_history: false,
@@ -113,23 +78,7 @@ impl State {
             overlay_return: Mode::Normal,
             input: String::new(),
             message: String::new(),
-            card: None,
-            requested_key: None,
-            card_loading: false,
-            card_scroll: 0,
-            search_results: Vec::new(),
-            search_selected: 0,
-            search_generation: 0,
-            search_token: Arc::new(AtomicU64::new(0)),
-            search_loading: false,
-            project_results: Vec::new(),
-            project_selected: 0,
-            project_loading: false,
-            project_generation: 0,
-            project_error: false,
-            transition_results: Vec::new(),
-            transition_selected: 0,
-            transition_loading: false,
+            jira,
             move_selected: 0,
             help_scroll: 0,
             configuration,
@@ -144,7 +93,7 @@ impl State {
 #[cfg(test)]
 impl Default for State {
     fn default() -> Self {
-        Self::new(configuration::State::default())
+        Self::new(configuration::State::default(), jira::State::test_default())
     }
 }
 
@@ -168,21 +117,15 @@ fn run_loop(
     docs_path: &Path,
     config: &mut AppConfig,
 ) -> Result<()> {
-    let (mut jira, jira_error) = match JiraClient::from_config() {
-        Ok(client) => (Some(client), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    let (sender, receiver) = mpsc::channel();
+    let jira = jira::State::new();
     let configuration = configuration::State::new(
         config_path()?.display().to_string(),
         store.path().display().to_string(),
         docs_path.display().to_string(),
         config.ui.accent.clone(),
-        jira.as_ref()
-            .map(|client| client.config().clone())
-            .or_else(|| JiraConfig::load().ok()),
+        jira.loaded_config(),
     )?;
-    let mut state = State::new(configuration);
+    let mut state = State::new(configuration, jira);
     let carried = store.carry()?;
     if carried > 0 {
         state.message = format!(
@@ -193,7 +136,9 @@ fn run_loop(
 
     loop {
         state.configuration.set_width(terminal.size()?.width);
-        handle_jira_events(&mut state, &receiver, &sender, jira.as_ref());
+        for action in state.jira.poll() {
+            apply_jira_action(action, &mut state, store)?;
+        }
         if let Some(message) = state.configuration.poll() {
             state.message = message;
         }
@@ -213,18 +158,12 @@ fn run_loop(
             WeekReport::entries,
         );
         state.selected = state.selected.min(entries.len().saturating_sub(1));
-        request_selected_card(&entries, &mut state, jira.as_ref(), &sender);
+        let selected_issue = entries
+            .get(state.selected)
+            .and_then(|entry| entry.task.jira.clone());
+        state.jira.select_issue(selected_issue);
 
-        terminal.draw(|frame| {
-            draw(
-                frame,
-                &entries,
-                &state,
-                jira.as_ref(),
-                jira_error.as_deref(),
-                week_report.as_ref(),
-            )
-        })?;
+        terminal.draw(|frame| draw(frame, &entries, &state, week_report.as_ref()))?;
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
@@ -234,7 +173,7 @@ fn run_loop(
         if key.kind == KeyEventKind::Release {
             continue;
         }
-        if handle_global_overlay_key(key.code, &mut state, jira.as_ref(), jira_error.as_deref()) {
+        if handle_global_overlay_key(key.code, &mut state) {
             continue;
         }
 
@@ -247,38 +186,44 @@ fn run_loop(
                 configuration::State::handle_overview(
                     &mut state.configuration,
                     key.code,
-                    jira.as_ref(),
-                    jira_error.as_deref(),
+                    state.jira.client(),
+                    state.jira.startup_error(),
                 ),
                 &mut state,
-                jira.as_ref(),
-                &sender,
-            ),
+                store,
+            )?,
             Mode::AccentPalette => apply_configuration_action(
                 state
                     .configuration
                     .handle_accent_palette(key.code, config)?,
                 &mut state,
-                jira.as_ref(),
-                &sender,
-            ),
+                store,
+            )?,
             Mode::AccentCustom => apply_configuration_action(
                 state.configuration.handle_custom_accent(key.code, config)?,
                 &mut state,
-                jira.as_ref(),
-                &sender,
-            ),
+                store,
+            )?,
             Mode::TaskSearch => handle_task_search_key(key.code, &mut state),
-            Mode::Search => handle_search_key(key.code, &mut state, store, jira.as_ref(), &sender)?,
+            Mode::Search => {
+                let action = state.jira.handle_search_key(key.code);
+                apply_jira_action(action, &mut state, store)?;
+            }
             Mode::Project => {
-                handle_project_key(key.code, &mut state, &mut jira)?;
+                let action = state.jira.handle_project_key(key.code)?;
+                apply_jira_action(action, &mut state, store)?;
             }
             Mode::Transition => {
-                handle_transition_key(key.code, &mut state, jira.as_ref(), &sender);
+                let action = state.jira.handle_transition_key(key.code);
+                apply_jira_action(action, &mut state, store)?;
             }
-            Mode::Comment => handle_comment_key(key.code, key.modifiers, &mut state),
+            Mode::Comment => {
+                let action = state.jira.handle_comment_key(key.code, key.modifiers);
+                apply_jira_action(action, &mut state, store)?;
+            }
             Mode::ConfirmComment => {
-                handle_confirmation_key(key.code, &mut state, jira.as_ref(), &sender)
+                let action = state.jira.handle_confirmation_key(key.code);
+                apply_jira_action(action, &mut state, store)?;
             }
             Mode::Normal if state.weekly => {
                 if handle_week_key(key.code, &entries, &mut state)? {
@@ -286,15 +231,7 @@ fn run_loop(
                 }
             }
             Mode::Normal => {
-                if handle_normal_key(
-                    key.code,
-                    &entries,
-                    &mut state,
-                    store,
-                    jira.as_ref(),
-                    jira_error.as_deref(),
-                    &sender,
-                )? {
+                if handle_normal_key(key.code, &entries, &mut state, store)? {
                     return Ok(());
                 }
             }
@@ -311,10 +248,14 @@ fn handle_normal_key(
     entries: &[Entry],
     state: &mut State,
     store: &mut Store,
-    jira: Option<&JiraClient>,
-    jira_error: Option<&str>,
-    sender: &Sender<JiraEvent>,
 ) -> Result<bool> {
+    let selected_task_id = entries
+        .get(state.selected)
+        .map(|entry| entry.task.id.as_str());
+    if let Some(action) = state.jira.handle_normal_key(key, selected_task_id) {
+        apply_jira_action(action, state, store)?;
+        return Ok(false);
+    }
     match key {
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Esc if !state.task_query.is_empty() => {
@@ -336,15 +277,15 @@ fn handle_normal_key(
         KeyCode::Char('e') if !entries.is_empty() => state.edit_document = true,
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
-            state.card_scroll = 0;
+            state.jira.reset_scroll();
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.selected = (state.selected + 1).min(entries.len().saturating_sub(1));
-            state.card_scroll = 0;
+            state.jira.reset_scroll();
         }
         KeyCode::Tab => state.jira_tab = !state.jira_tab,
-        KeyCode::PageDown => state.card_scroll = state.card_scroll.saturating_add(8),
-        KeyCode::PageUp => state.card_scroll = state.card_scroll.saturating_sub(8),
+        KeyCode::PageDown => state.jira.scroll_down(),
+        KeyCode::PageUp => state.jira.scroll_up(),
         KeyCode::Char('a') => {
             state.mode = Mode::Add;
             state.input.clear();
@@ -391,60 +332,6 @@ fn handle_normal_key(
             state.selected = 0;
             state.message = format!("Carried {count} task{}", if count == 1 { "" } else { "s" });
         }
-        KeyCode::Char('l') if !entries.is_empty() => {
-            let Some(client) = jira else {
-                state.message = jira_error.unwrap_or("Jira is unavailable").to_owned();
-                return Ok(false);
-            };
-            if client.config().project.is_none() {
-                state.message = "Select JIRA.Project in Configuration first (g)".to_owned();
-                return Ok(false);
-            }
-            state.mode = Mode::Search;
-            state.input.clear();
-            state.search_results.clear();
-            state.search_selected = 0;
-            request_search(state, client, sender, false);
-        }
-        KeyCode::Char('u') if !entries.is_empty() => {
-            store.unlink_jira(&entries[state.selected].task.id)?;
-            state.message = "Jira link removed".to_owned();
-        }
-        KeyCode::Char('c') => {
-            if state.card.is_some() && jira.is_some() {
-                state.mode = Mode::Comment;
-                state.input.clear();
-            } else {
-                state.message = "Select a linked Jira task first".to_owned();
-            }
-        }
-        KeyCode::Char('t') => {
-            if let (Some(client), Some(card)) = (jira, state.card.as_ref()) {
-                let key = card.key.clone();
-                open_transition_selector(state, client, &key, sender);
-            } else {
-                state.message = "Select a linked Jira task first".to_owned();
-            }
-        }
-        KeyCode::Char('r') => {
-            state.requested_key = None;
-            state.card_loading = false;
-        }
-        KeyCode::Char('m') => {
-            if let (Some(client), Some(card)) = (jira, state.card.as_ref()) {
-                let client = client.clone();
-                let key = card.key.clone();
-                let event_key = key.clone();
-                let sender = sender.clone();
-                thread::spawn(move || {
-                    let result = client
-                        .issue_comments(&key, 50)
-                        .map_err(|error| error.to_string());
-                    let _ = sender.send(JiraEvent::MoreComments(event_key, result));
-                });
-                state.message = "Loading more comments...".to_owned();
-            }
-        }
         _ => {}
     }
     Ok(false)
@@ -472,21 +359,18 @@ fn handle_week_key(key: KeyCode, entries: &[Entry], state: &mut State) -> Result
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
-            state.card_scroll = 0;
+            state.jira.reset_scroll();
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.selected = (state.selected + 1).min(entries.len().saturating_sub(1));
-            state.card_scroll = 0;
+            state.jira.reset_scroll();
         }
         KeyCode::Char('e') if !entries.is_empty() => state.edit_document = true,
         KeyCode::Enter if !entries.is_empty() => state.jira_tab = true,
         KeyCode::Tab => state.jira_tab = !state.jira_tab,
-        KeyCode::PageDown => state.card_scroll = state.card_scroll.saturating_add(8),
-        KeyCode::PageUp => state.card_scroll = state.card_scroll.saturating_sub(8),
-        KeyCode::Char('r') => {
-            state.requested_key = None;
-            state.card_loading = false;
-        }
+        KeyCode::PageDown => state.jira.scroll_down(),
+        KeyCode::PageUp => state.jira.scroll_up(),
+        KeyCode::Char('r') => state.jira.refresh(),
         _ => {}
     }
     Ok(false)
@@ -568,12 +452,7 @@ fn handle_help_key(key: KeyCode, state: &mut State) {
     }
 }
 
-fn handle_global_overlay_key(
-    key: KeyCode,
-    state: &mut State,
-    jira: Option<&JiraClient>,
-    jira_error: Option<&str>,
-) -> bool {
+fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
     match key {
         KeyCode::Char('?') if state.mode == Mode::Help => {
             state.mode = state.overlay_return;
@@ -597,7 +476,10 @@ fn handle_global_overlay_key(
         }
         KeyCode::Char('g') if state.mode == Mode::Normal => {
             state.mode = Mode::Configuration;
-            if let Some(message) = state.configuration.open(jira, jira_error) {
+            if let Some(message) = state
+                .configuration
+                .open(state.jira.client(), state.jira.startup_error())
+            {
                 state.message = message;
             }
             true
@@ -609,9 +491,8 @@ fn handle_global_overlay_key(
 fn apply_configuration_action(
     action: configuration::Action,
     state: &mut State,
-    jira: Option<&JiraClient>,
-    sender: &Sender<JiraEvent>,
-) {
+    store: &mut Store,
+) -> Result<()> {
     match action {
         configuration::Action::None => {}
         configuration::Action::Close => {
@@ -624,9 +505,8 @@ fn apply_configuration_action(
         configuration::Action::OpenAccent => state.mode = Mode::AccentPalette,
         configuration::Action::OpenCustomAccent => state.mode = Mode::AccentCustom,
         configuration::Action::OpenProject => {
-            if let Some(client) = jira {
-                open_project_selector(state, client, sender);
-            }
+            let action = state.jira.open_project();
+            apply_jira_action(action, state, store)?;
         }
         configuration::Action::Message(message) => {
             state.message = message;
@@ -636,6 +516,42 @@ fn apply_configuration_action(
             state.mode = Mode::Configuration;
         }
     }
+    Ok(())
+}
+
+fn apply_jira_action(action: jira::Action, state: &mut State, store: &mut Store) -> Result<()> {
+    if let Some(effect) = action.store {
+        match effect {
+            jira::StoreEffect::Link { task_id, issue_key } => {
+                store.link_jira(&task_id, &issue_key)?;
+            }
+            jira::StoreEffect::Import { summary, issue_key } => {
+                store.add_linked(&summary, Some(&issue_key))?;
+                state.show_history = false;
+            }
+            jira::StoreEffect::Unlink { task_id } => {
+                store.unlink_jira(&task_id)?;
+            }
+        }
+    }
+    if let Some(config) = action.config {
+        state.configuration.set_jira_config(config);
+    }
+    if let Some(message) = action.notice {
+        state.message = message;
+    }
+    if let Some(mode) = action.mode {
+        state.mode = match mode {
+            jira::ModeIntent::Normal => Mode::Normal,
+            jira::ModeIntent::Configuration => Mode::Configuration,
+            jira::ModeIntent::Search => Mode::Search,
+            jira::ModeIntent::Project => Mode::Project,
+            jira::ModeIntent::Transition => Mode::Transition,
+            jira::ModeIntent::Comment => Mode::Comment,
+            jira::ModeIntent::ConfirmComment => Mode::ConfirmComment,
+        };
+    }
+    Ok(())
 }
 
 fn handle_task_search_key(key: KeyCode, state: &mut State) {
@@ -656,213 +572,6 @@ fn handle_task_search_key(key: KeyCode, state: &mut State) {
         }
         _ => {}
     }
-}
-
-fn handle_search_key(
-    key: KeyCode,
-    state: &mut State,
-    store: &mut Store,
-    jira: Option<&JiraClient>,
-    sender: &Sender<JiraEvent>,
-) -> Result<()> {
-    match key {
-        KeyCode::Esc => {
-            state.mode = Mode::Normal;
-            state.input.clear();
-        }
-        KeyCode::Up => state.search_selected = state.search_selected.saturating_sub(1),
-        KeyCode::Down => {
-            state.search_selected =
-                (state.search_selected + 1).min(state.search_results.len().saturating_sub(1));
-        }
-        KeyCode::Enter if !state.search_results.is_empty() => {
-            let entries = entries(
-                store,
-                state.show_history,
-                state.show_backlog,
-                &state.task_query,
-            );
-            if let Some(entry) = entries.get(state.selected) {
-                let issue = &state.search_results[state.search_selected];
-                store.link_jira(&entry.task.id, &issue.key)?;
-                state.message = format!("Linked to {}", issue.key);
-                state.mode = Mode::Normal;
-                state.input.clear();
-            }
-        }
-        KeyCode::Char('i') if !state.search_results.is_empty() => {
-            let issue = &state.search_results[state.search_selected];
-            store.add_linked(&issue.summary, Some(&issue.key))?;
-            state.message = format!("Imported {}", issue.key);
-            state.show_history = false;
-            state.mode = Mode::Normal;
-            state.input.clear();
-        }
-        KeyCode::Backspace => {
-            state.input.pop();
-            if let Some(client) = jira {
-                request_search(state, client, sender, true);
-            }
-        }
-        KeyCode::Char(character) => {
-            state.input.push(character);
-            if let Some(client) = jira {
-                request_search(state, client, sender, true);
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_project_key(
-    key: KeyCode,
-    state: &mut State,
-    jira: &mut Option<JiraClient>,
-) -> Result<()> {
-    match key {
-        KeyCode::Esc => {
-            state.project_generation = state.project_generation.wrapping_add(1);
-            state.project_loading = false;
-            state.mode = Mode::Configuration;
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.project_selected = state.project_selected.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.project_selected =
-                (state.project_selected + 1).min(state.project_results.len().saturating_sub(1));
-        }
-        KeyCode::Enter if !state.project_results.is_empty() => {
-            let project = &state.project_results[state.project_selected];
-            if let Some(client) = jira.as_mut() {
-                client.set_project(&project.key)?;
-                state.configuration.set_jira_config(client.config().clone());
-                state.message = format!("Jira project set to {} ({})", project.key, project.name);
-                state.mode = Mode::Configuration;
-                state.search_results.clear();
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_transition_key(
-    key: KeyCode,
-    state: &mut State,
-    jira: Option<&JiraClient>,
-    sender: &Sender<JiraEvent>,
-) {
-    match key {
-        KeyCode::Esc => state.mode = Mode::Normal,
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.transition_selected = state.transition_selected.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.transition_selected = (state.transition_selected + 1)
-                .min(state.transition_results.len().saturating_sub(1));
-        }
-        KeyCode::Enter if !state.transition_results.is_empty() => {
-            if let (Some(client), Some(card)) = (jira, state.card.as_ref()) {
-                let transition = &state.transition_results[state.transition_selected];
-                let client = client.clone();
-                let key = card.key.clone();
-                let event_key = key.clone();
-                let transition_id = transition.id.clone();
-                let transition_name = transition.name.clone();
-                let sender = sender.clone();
-                thread::spawn(move || {
-                    let result = client
-                        .transition_issue(&key, &transition_id)
-                        .map_err(|error| error.to_string());
-                    let _ = sender.send(JiraEvent::Transitioned(event_key, result));
-                });
-                state.message = format!("Applying Jira transition: {transition_name}...");
-                state.mode = Mode::Normal;
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_comment_key(key: KeyCode, modifiers: KeyModifiers, state: &mut State) {
-    match key {
-        KeyCode::Esc => {
-            state.input.clear();
-            state.mode = Mode::Normal;
-        }
-        KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if !state.input.trim().is_empty() {
-                state.mode = Mode::ConfirmComment;
-            }
-        }
-        KeyCode::Enter => state.input.push('\n'),
-        KeyCode::Backspace => {
-            state.input.pop();
-        }
-        KeyCode::Char(character) => state.input.push(character),
-        _ => {}
-    }
-}
-
-fn handle_confirmation_key(
-    key: KeyCode,
-    state: &mut State,
-    jira: Option<&JiraClient>,
-    sender: &Sender<JiraEvent>,
-) {
-    match key {
-        KeyCode::Char('y') | KeyCode::Enter => {
-            if let (Some(client), Some(card)) = (jira, state.card.as_ref()) {
-                let client = client.clone();
-                let key = card.key.clone();
-                let event_key = key.clone();
-                let text = state.input.clone();
-                let sender = sender.clone();
-                thread::spawn(move || {
-                    let result = client
-                        .post_comment(&key, &text)
-                        .map_err(|error| error.to_string());
-                    let _ = sender.send(JiraEvent::Comment(event_key, result));
-                });
-                state.message = "Posting Jira comment...".to_owned();
-                state.input.clear();
-                state.mode = Mode::Normal;
-            }
-        }
-        KeyCode::Char('n') | KeyCode::Esc => state.mode = Mode::Comment,
-        _ => {}
-    }
-}
-
-fn request_selected_card(
-    entries: &[Entry],
-    state: &mut State,
-    jira: Option<&JiraClient>,
-    sender: &Sender<JiraEvent>,
-) {
-    let key = entries
-        .get(state.selected)
-        .and_then(|entry| entry.task.jira.clone());
-    if key == state.requested_key {
-        return;
-    }
-    state.requested_key = key.clone();
-    state.card = None;
-    state.card_scroll = 0;
-    state.card_loading = false;
-    let (Some(key), Some(client)) = (key, jira) else {
-        return;
-    };
-    state.card_loading = true;
-    let event_key = key.clone();
-    let client = client.clone();
-    let sender = sender.clone();
-    thread::spawn(move || {
-        let result = client.issue_card(&key).map_err(|error| error.to_string());
-        let _ = sender.send(JiraEvent::Card(event_key, Box::new(result)));
-    });
 }
 
 fn edit_selected_document(
@@ -909,171 +618,6 @@ fn edit_selected_document(
     Ok(())
 }
 
-fn request_search(
-    state: &mut State,
-    client: &JiraClient,
-    sender: &Sender<JiraEvent>,
-    debounce: bool,
-) {
-    state.search_generation += 1;
-    let generation = state.search_generation;
-    state.search_token.store(generation, Ordering::Relaxed);
-    let search_token = Arc::clone(&state.search_token);
-    let query = state.input.clone();
-    let client = client.clone();
-    let sender = sender.clone();
-    state.search_loading = true;
-    thread::spawn(move || {
-        if debounce {
-            thread::sleep(Duration::from_millis(300));
-        }
-        if search_token.load(Ordering::Relaxed) != generation {
-            return;
-        }
-        let result = client
-            .search_issues(&query)
-            .map_err(|error| error.to_string());
-        let _ = sender.send(JiraEvent::Search(generation, result));
-    });
-}
-
-fn open_project_selector(state: &mut State, client: &JiraClient, sender: &Sender<JiraEvent>) {
-    state.mode = Mode::Project;
-    state.project_results.clear();
-    state.project_selected = 0;
-    state.project_loading = true;
-    state.project_error = false;
-    state.project_generation = state.project_generation.wrapping_add(1);
-    let generation = state.project_generation;
-    let client = client.clone();
-    let sender = sender.clone();
-    thread::spawn(move || {
-        let result = client.projects().map_err(|error| error.to_string());
-        let _ = sender.send(JiraEvent::Projects(generation, result));
-    });
-}
-
-fn open_transition_selector(
-    state: &mut State,
-    client: &JiraClient,
-    key: &str,
-    sender: &Sender<JiraEvent>,
-) {
-    state.mode = Mode::Transition;
-    state.transition_results.clear();
-    state.transition_selected = 0;
-    state.transition_loading = true;
-    let client = client.clone();
-    let key = key.to_owned();
-    let event_key = key.clone();
-    let sender = sender.clone();
-    thread::spawn(move || {
-        let result = client.transitions(&key).map_err(|error| error.to_string());
-        let _ = sender.send(JiraEvent::Transitions(event_key, result));
-    });
-}
-
-fn handle_jira_events(
-    state: &mut State,
-    receiver: &Receiver<JiraEvent>,
-    sender: &Sender<JiraEvent>,
-    jira: Option<&JiraClient>,
-) {
-    while let Ok(event) = receiver.try_recv() {
-        match event {
-            JiraEvent::Card(key, result) if state.requested_key.as_deref() == Some(&key) => {
-                state.card_loading = false;
-                match *result {
-                    Ok(card) => state.card = Some(card),
-                    Err(error) => state.message = error,
-                }
-            }
-            JiraEvent::Search(generation, result) if generation == state.search_generation => {
-                state.search_loading = false;
-                match result {
-                    Ok(issues) => {
-                        state.search_results = issues;
-                        state.search_selected = 0;
-                    }
-                    Err(error) => state.message = error,
-                }
-            }
-            JiraEvent::Projects(generation, result) if generation == state.project_generation => {
-                state.project_loading = false;
-                match result {
-                    Ok(projects) => {
-                        state.project_error = false;
-                        state.project_results = projects;
-                        if state.project_results.is_empty() {
-                            state.message =
-                                "No Jira projects are available for this account".to_owned();
-                        }
-                        state.project_selected = jira
-                            .and_then(|client| client.config().project.as_deref())
-                            .and_then(|selected| {
-                                state
-                                    .project_results
-                                    .iter()
-                                    .position(|project| project.key == selected)
-                            })
-                            .unwrap_or(0);
-                    }
-                    Err(error) => {
-                        state.project_error = true;
-                        state.message = error;
-                    }
-                }
-            }
-            JiraEvent::Transitions(key, result)
-                if state.card.as_ref().is_some_and(|card| card.key == key) =>
-            {
-                state.transition_loading = false;
-                match result {
-                    Ok(transitions) => {
-                        state.transition_results = transitions;
-                        state.transition_selected = 0;
-                    }
-                    Err(error) => state.message = error,
-                }
-            }
-            JiraEvent::Transitioned(key, result) => match result {
-                Ok(()) => {
-                    state.message = format!("Updated Jira status for {key}");
-                    state.requested_key = None;
-                    state.card_loading = false;
-                }
-                Err(error) => state.message = error,
-            },
-            JiraEvent::Comment(key, result) => match result {
-                Ok(_) => {
-                    state.message = format!("Comment posted to {key}");
-                    state.requested_key = None;
-                    state.card_loading = false;
-                }
-                Err(error) => state.message = error,
-            },
-            JiraEvent::MoreComments(key, result)
-                if state.card.as_ref().is_some_and(|card| card.key == key) =>
-            {
-                match result {
-                    Ok(comments) => {
-                        if let Some(card) = state.card.as_mut() {
-                            card.comments = comments;
-                        }
-                        state.message = "Loaded comment history".to_owned();
-                    }
-                    Err(error) => state.message = error,
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if state.requested_key.is_none() && jira.is_some() && !state.card_loading {
-        let _ = sender;
-    }
-}
-
 fn entries(store: &Store, show_history: bool, show_backlog: bool, query: &str) -> Vec<Entry> {
     let entries = if show_history {
         let all = store.entries_all().into_iter().collect::<Vec<_>>();
@@ -1112,14 +656,7 @@ fn task_matches(entry: &Entry, query: &str) -> bool {
             .is_some_and(|key| key.to_lowercase().contains(&query))
 }
 
-fn draw(
-    frame: &mut Frame,
-    entries: &[Entry],
-    state: &State,
-    jira: Option<&JiraClient>,
-    jira_error: Option<&str>,
-    week_report: Option<&WeekReport>,
-) {
+fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option<&WeekReport>) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1146,9 +683,9 @@ fn draw(
         } else {
             draw_tasks(frame, panes[0], entries, state);
         }
-        draw_jira_card(frame, panes[1], state, jira, jira_error);
+        jira::draw_card(frame, panes[1], &state.jira, state.configuration.accent());
     } else if state.jira_tab {
-        draw_jira_card(frame, areas[1], state, jira, jira_error);
+        jira::draw_card(frame, areas[1], &state.jira, state.configuration.accent());
     } else {
         if let Some(report) = week_report {
             draw_week_tasks(
@@ -1174,7 +711,7 @@ fn draw(
         Mode::Move => draw_move_selector(frame, state),
         Mode::Help => draw_help(frame, state),
         Mode::Configuration => {
-            configuration::draw_overview(frame, &state.configuration, jira_error)
+            configuration::draw_overview(frame, &state.configuration, state.jira.startup_error())
         }
         Mode::AccentPalette => configuration::draw_accent(frame, &state.configuration),
         Mode::AccentCustom => configuration::draw_custom_accent(frame, &state.configuration),
@@ -1183,11 +720,11 @@ fn draw(
             "Search tasks / Enter keep / Esc clear",
             &state.task_query,
         ),
-        Mode::Search => draw_search(frame, state),
-        Mode::Project => draw_project_selector(frame, state),
-        Mode::Transition => draw_transition_selector(frame, state),
-        Mode::Comment => draw_comment_editor(frame, state),
-        Mode::ConfirmComment => draw_comment_confirmation(frame, state),
+        Mode::Search => jira::draw_search(frame, &state.jira, state.configuration.accent()),
+        Mode::Project => jira::draw_project(frame, &state.jira, state.configuration.accent()),
+        Mode::Transition => jira::draw_transition(frame, &state.jira),
+        Mode::Comment => jira::draw_comment(frame, &state.jira),
+        Mode::ConfirmComment => jira::draw_comment_confirmation(frame, &state.jira),
         Mode::Normal => {}
     }
 }
@@ -1415,230 +952,6 @@ fn draw_task_list(
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn draw_jira_card(
-    frame: &mut Frame,
-    area: Rect,
-    state: &State,
-    jira: Option<&JiraClient>,
-    jira_error: Option<&str>,
-) {
-    let project = jira.and_then(|client| client.config().project.as_deref());
-    let title = project.map_or_else(|| " JIRA ".to_owned(), |key| format!(" JIRA / {key} "));
-    let block = Block::default().title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if let Some(error) = jira_error {
-        frame.render_widget(
-            Paragraph::new(format!(
-                "Jira unavailable\n\n{error}\n\nRun `zls jira auth` or provide ZLS_JIRA_TOKEN to tmux."
-            ))
-            .wrap(Wrap { trim: false })
-            .alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
-    if project.is_none() && state.card.is_none() {
-        frame.render_widget(
-            Paragraph::new(
-                "No Jira project selected.\n\nOpen Configuration with g to choose your project.",
-            )
-            .alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
-    if state.card_loading {
-        frame.render_widget(Paragraph::new("Loading Jira card..."), inner);
-        return;
-    }
-    let Some(card) = state.card.as_ref() else {
-        frame.render_widget(
-            Paragraph::new("Link a task with l to see its Jira card here.")
-                .alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                &card.key,
-                Style::default()
-                    .fg(state.configuration.accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("   "),
-            Span::styled(format!("[{}]", card.status), status_style(&card.status)),
-            if card.stale {
-                Span::styled("  CACHED", Style::default().fg(Color::Yellow))
-            } else {
-                Span::raw("")
-            },
-        ]),
-        Line::styled(&card.summary, Style::default().add_modifier(Modifier::BOLD)),
-        Line::raw(""),
-        section_separator("DETAILS", inner.width),
-    ];
-    lines.push(detail_pair(
-        "Type",
-        card.issue_type.as_deref().unwrap_or("Unknown"),
-        "Priority",
-        card.priority.as_deref().unwrap_or("None"),
-    ));
-    lines.push(detail_pair(
-        "Assignee",
-        card.assignee.as_deref().unwrap_or("Unassigned"),
-        "Reporter",
-        card.reporter.as_deref().unwrap_or("Unknown"),
-    ));
-    lines.push(detail_pair(
-        "Creator",
-        card.creator.as_deref().unwrap_or("Unknown"),
-        "Resolution",
-        card.resolution.as_deref().unwrap_or("Unresolved"),
-    ));
-    if let Some(parent) = card.parent.as_ref() {
-        lines.push(detail_line(
-            "Parent",
-            &format!("{} [{}] {}", parent.key, parent.status, parent.summary),
-        ));
-    }
-    if !card.sprints.is_empty() {
-        lines.push(detail_line("Sprint", &card.sprints.join(", ")));
-    }
-    if !card.labels.is_empty() {
-        lines.push(detail_line("Labels", &card.labels.join(", ")));
-    }
-    if !card.components.is_empty() {
-        lines.push(detail_line("Components", &card.components.join(", ")));
-    }
-    if !card.fix_versions.is_empty() {
-        lines.push(detail_line("Fix versions", &card.fix_versions.join(", ")));
-    }
-    let created = card
-        .created
-        .as_deref()
-        .map(format_jira_datetime)
-        .unwrap_or_else(|| "Unknown".to_owned());
-    let updated = card
-        .updated
-        .as_deref()
-        .map(format_jira_datetime)
-        .unwrap_or_else(|| "Unknown".to_owned());
-    lines.push(detail_pair("Created", &created, "Updated", &updated));
-    if let Some(due_date) = card.due_date.as_deref() {
-        lines.push(detail_line("Due", due_date));
-    }
-
-    lines.push(Line::raw(""));
-    lines.push(section_separator("DESCRIPTION", inner.width));
-    append_text(&mut lines, &card.description, "No description.");
-
-    if !card.subtasks.is_empty() || !card.links.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(section_separator("RELATED WORK", inner.width));
-        for subtask in &card.subtasks {
-            lines.push(Line::raw(format!(
-                "  {} [{}] {}",
-                subtask.key, subtask.status, subtask.summary
-            )));
-        }
-        for link in &card.links {
-            lines.push(Line::raw(format!(
-                "  {} {} [{}] {}",
-                link.relationship, link.key, link.status, link.summary
-            )));
-        }
-    }
-
-    lines.push(Line::raw(""));
-    lines.push(section_separator(
-        &format!("COMMENTS ({})", card.comments.len()),
-        inner.width,
-    ));
-    if card.comments.is_empty() {
-        lines.push(Line::raw("No comments."));
-    }
-    for comment in &card.comments {
-        lines.push(Line::styled(
-            format!(
-                "{}  /  {}",
-                comment.author,
-                format_jira_datetime(&comment.created)
-            ),
-            Style::default().fg(state.configuration.accent()),
-        ));
-        append_text(&mut lines, &comment.body, "");
-        lines.push(Line::raw(""));
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((state.card_scroll, 0)),
-        inner,
-    );
-}
-
-fn section_separator(title: &str, width: u16) -> Line<'static> {
-    let prefix = format!("-- {title} ");
-    let remaining = usize::from(width).saturating_sub(prefix.chars().count() + 1);
-    Line::styled(
-        format!("{prefix}{}", "-".repeat(remaining)),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn detail_line(label: &str, value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
-        Span::raw(value.to_owned()),
-    ])
-}
-
-fn detail_pair(left_label: &str, left: &str, right_label: &str, right: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{left_label:<11}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw(format!("{left:<22}")),
-        Span::styled(
-            format!("{right_label:<11}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw(right.to_owned()),
-    ])
-}
-
-fn status_style(status: &str) -> Style {
-    let status = status.to_ascii_lowercase();
-    let color =
-        if status.contains("done") || status.contains("closed") || status.contains("resolved") {
-            Color::Green
-        } else if status.contains("progress") || status.contains("review") {
-            Color::Yellow
-        } else if status.contains("block") {
-            Color::Red
-        } else {
-            Color::Cyan
-        };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-fn append_text<'a>(lines: &mut Vec<Line<'a>>, text: &'a str, fallback: &'a str) {
-    let text = if text.trim().is_empty() {
-        fallback
-    } else {
-        text
-    };
-    lines.extend(text.lines().map(Line::raw));
-}
-
 fn draw_single_input(frame: &mut Frame, title: &str, input: &str) {
     let area = centered_fixed(frame.area(), 70, 3);
     frame.render_widget(Clear, area);
@@ -1647,55 +960,6 @@ fn draw_single_input(frame: &mut Frame, title: &str, input: &str) {
         area,
     );
     frame.set_cursor_position((area.x + input.chars().count() as u16 + 1, area.y + 1));
-}
-
-fn draw_search(frame: &mut Frame, state: &State) {
-    let area = centered(frame.area(), 80, 70);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" LINK JIRA / Enter link / i import / Esc cancel ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(inner);
-    let title = if state.search_loading {
-        "Search Jira (loading...)"
-    } else {
-        "Search Jira"
-    };
-    frame.render_widget(
-        Paragraph::new(state.input.as_str())
-            .block(Block::default().borders(Borders::BOTTOM).title(title)),
-        rows[0],
-    );
-    let items = state
-        .search_results
-        .iter()
-        .map(|issue| {
-            ListItem::new(vec![
-                Line::styled(
-                    format!("{}  [{}]", issue.key, issue.status),
-                    Style::default()
-                        .fg(state.configuration.accent())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Line::raw(&issue.summary),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let list = List::new(items)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    let mut list_state = ListState::default()
-        .with_selected((!state.search_results.is_empty()).then_some(state.search_selected));
-    frame.render_stateful_widget(list, rows[1], &mut list_state);
-    frame.set_cursor_position((
-        rows[0].x + state.input.chars().count() as u16,
-        rows[0].y + 1,
-    ));
 }
 
 fn draw_move_selector(frame: &mut Frame, state: &State) {
@@ -1766,125 +1030,6 @@ fn draw_help(frame: &mut Frame, state: &State) {
     );
 }
 
-fn draw_project_selector(frame: &mut Frame, state: &State) {
-    let area = centered(frame.area(), 65, 65);
-    frame.render_widget(Clear, area);
-    let title = if state.project_loading {
-        " JIRA PROJECT / loading... / Esc cancel "
-    } else if state.project_error {
-        " JIRA PROJECT / load failed / Esc back "
-    } else if state.project_results.is_empty() {
-        " JIRA PROJECT / no projects / Esc back "
-    } else {
-        " JIRA PROJECT / Enter select / Esc cancel "
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let items = state
-        .project_results
-        .iter()
-        .map(|project| {
-            ListItem::new(vec![
-                Line::styled(
-                    &project.key,
-                    Style::default()
-                        .fg(state.configuration.accent())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Line::raw(&project.name),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let list = List::new(items)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    let mut list_state = ListState::default()
-        .with_selected((!state.project_results.is_empty()).then_some(state.project_selected));
-    frame.render_stateful_widget(list, inner, &mut list_state);
-}
-
-fn draw_transition_selector(frame: &mut Frame, state: &State) {
-    let height = (state.transition_results.len() as u16 + 2).clamp(5, 14);
-    let area = centered_fixed(frame.area(), 48, height);
-    frame.render_widget(Clear, area);
-    let title = if state.transition_loading {
-        " CHANGE STATUS / loading... / Esc cancel "
-    } else {
-        " CHANGE STATUS / Enter apply / Esc cancel "
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let items = state
-        .transition_results
-        .iter()
-        .map(|transition| {
-            if transition.name.eq_ignore_ascii_case(&transition.to_status) {
-                ListItem::new(Line::styled(
-                    &transition.to_status,
-                    status_style(&transition.to_status),
-                ))
-            } else {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        &transition.name,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  ->  "),
-                    Span::styled(&transition.to_status, status_style(&transition.to_status)),
-                ]))
-            }
-        })
-        .collect::<Vec<_>>();
-    let list = List::new(items)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    let mut list_state = ListState::default()
-        .with_selected((!state.transition_results.is_empty()).then_some(state.transition_selected));
-    frame.render_stateful_widget(list, inner, &mut list_state);
-}
-
-fn draw_comment_editor(frame: &mut Frame, state: &State) {
-    let area = centered(frame.area(), 75, 60);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(state.input.as_str())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" JIRA COMMENT / Ctrl-S review / Esc cancel "),
-            ),
-        area,
-    );
-    let line_count = state.input.lines().count().max(1) as u16;
-    let column = state
-        .input
-        .lines()
-        .last()
-        .map_or(0, |line| line.chars().count()) as u16;
-    frame.set_cursor_position((
-        area.x + column + 1,
-        area.y + line_count.min(area.height - 2),
-    ));
-}
-
-fn draw_comment_confirmation(frame: &mut Frame, state: &State) {
-    let area = centered(frame.area(), 65, 45);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(state.input.as_str())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" POST THIS COMMENT? / y yes / n edit "),
-            ),
-        area,
-    );
-}
-
 fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1942,57 +1087,25 @@ mod tests {
     }
 
     #[test]
-    fn jira_project_selector_returns_to_configuration() -> Result<()> {
-        let mut state = State {
-            mode: Mode::Project,
-            ..State::default()
-        };
-
-        handle_project_key(KeyCode::Esc, &mut state, &mut None)?;
-
-        assert!(matches!(state.mode, Mode::Configuration));
-        Ok(())
-    }
-
-    #[test]
-    fn stale_project_responses_are_ignored() {
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(JiraEvent::Projects(1, Err("stale error".to_owned())))
-            .unwrap();
-        let mut state = State {
-            project_generation: 2,
-            message: "Current message".to_owned(),
-            ..State::default()
-        };
-
-        handle_jira_events(&mut state, &receiver, &sender, None);
-
-        assert_eq!(state.message, "Current message");
-    }
-
-    #[test]
-    fn configuration_opens_and_closes_without_leaving_week_view() {
+    fn configuration_opens_and_closes_without_leaving_week_view() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
         let mut state = State {
             weekly: true,
             mode: Mode::Normal,
             ..State::default()
         };
 
-        assert!(handle_global_overlay_key(
-            KeyCode::Char('g'),
-            &mut state,
-            None,
-            None
-        ));
+        assert!(handle_global_overlay_key(KeyCode::Char('g'), &mut state));
         assert!(matches!(state.mode, Mode::Configuration));
         let action = state
             .configuration
             .handle_overview(KeyCode::Esc, None, None);
-        apply_configuration_action(action, &mut state, None, &mpsc::channel().0);
+        apply_configuration_action(action, &mut state, &mut store)?;
 
         assert!(matches!(state.mode, Mode::Normal));
         assert!(state.weekly);
+        Ok(())
     }
 
     #[test]
@@ -2002,12 +1115,7 @@ mod tests {
             ..State::default()
         };
 
-        assert!(handle_global_overlay_key(
-            KeyCode::Char('?'),
-            &mut state,
-            None,
-            None
-        ));
+        assert!(handle_global_overlay_key(KeyCode::Char('?'), &mut state));
         assert!(matches!(state.mode, Mode::Help));
         handle_help_key(KeyCode::Esc, &mut state);
 
@@ -2021,40 +1129,78 @@ mod tests {
             ..State::default()
         };
 
-        assert!(!handle_global_overlay_key(
-            KeyCode::Char('?'),
-            &mut state,
-            None,
-            None
-        ));
+        assert!(!handle_global_overlay_key(KeyCode::Char('?'), &mut state));
     }
 
     #[test]
-    fn configuration_actions_map_to_global_modes() {
-        let (sender, _receiver) = mpsc::channel();
+    fn configuration_actions_map_to_global_modes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
         let mut state = State::default();
 
-        apply_configuration_action(configuration::Action::OpenAccent, &mut state, None, &sender);
+        apply_configuration_action(configuration::Action::OpenAccent, &mut state, &mut store)?;
         assert!(matches!(state.mode, Mode::AccentPalette));
 
         apply_configuration_action(
             configuration::Action::OpenCustomAccent,
             &mut state,
-            None,
-            &sender,
-        );
+            &mut store,
+        )?;
         assert!(matches!(state.mode, Mode::AccentCustom));
 
-        apply_configuration_action(configuration::Action::Close, &mut state, None, &sender);
+        apply_configuration_action(configuration::Action::Close, &mut state, &mut store)?;
         assert!(matches!(state.mode, Mode::AccentPalette));
 
         apply_configuration_action(
             configuration::Action::AccentSaved("saved".to_owned()),
             &mut state,
-            None,
-            &sender,
-        );
+            &mut store,
+        )?;
         assert!(matches!(state.mode, Mode::Configuration));
         assert_eq!(state.message, "saved");
+        Ok(())
+    }
+
+    #[test]
+    fn jira_effects_are_applied_to_root_and_store() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        let task = store.add("Existing task")?;
+        let mut state = State::default();
+        let action = jira::Action {
+            mode: Some(jira::ModeIntent::Normal),
+            notice: Some("Linked to APP-9".to_owned()),
+            store: Some(jira::StoreEffect::Link {
+                task_id: task.id,
+                issue_key: "APP-9".to_owned(),
+            }),
+            config: None,
+        };
+
+        apply_jira_action(action, &mut state, &mut store)?;
+
+        assert_eq!(store.entries_today()[0].task.jira.as_deref(), Some("APP-9"));
+        assert_eq!(state.message, "Linked to APP-9");
+        assert!(matches!(state.mode, Mode::Normal));
+
+        apply_jira_action(
+            jira::Action {
+                mode: Some(jira::ModeIntent::Normal),
+                notice: Some("Imported APP-10".to_owned()),
+                store: Some(jira::StoreEffect::Import {
+                    summary: "Imported task".to_owned(),
+                    issue_key: "APP-10".to_owned(),
+                }),
+                config: None,
+            },
+            &mut state,
+            &mut store,
+        )?;
+
+        assert!(store.entries_today().iter().any(|entry| {
+            entry.task.text == "Imported task" && entry.task.jira.as_deref() == Some("APP-10")
+        }));
+        assert_eq!(state.message, "Imported APP-10");
+        Ok(())
     }
 }
