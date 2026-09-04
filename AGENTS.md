@@ -108,7 +108,7 @@ API tokens are secrets:
 - Carry is idempotent and moves only overdue unfinished tasks. It must not move backlog or future tasks.
 - Backlog entries use the reserved `## Backlog` heading when present; empty backlog sections may be omitted.
 - Weekly reports use Monday through Sunday and keep dated entries before undated completions.
-- Task documents are created lazily as `<task-id>.md`, linked from task metadata, and never rewritten after creation.
+- Task documents are created lazily as `<task-id>.md` and linked from task metadata. Only explicit edits and `docs set/append` rewrite them.
 - Reject document paths and symlinks that escape the configured documentation root.
 
 ## Testing Guidance

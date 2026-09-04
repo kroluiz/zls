@@ -15,7 +15,7 @@ path = "/home/luiz/.local/share/zls/docs"
 accent = "#00FFFF"
 ```
 
-Edit these paths to move the task store or documentation directory. `ZLS_FILE` and `--file` remain available as temporary task-file overrides.
+Edit these paths to move the task store or documentation directory. `ZLS_FILE` and the root option `zls --file PATH <COMMAND>` remain available as temporary task-file overrides.
 
 ## Build
 
@@ -92,6 +92,7 @@ Backlog CLI operations are also available:
 ./target/release/zls history
 ./target/release/zls carry
 ./target/release/zls status
+./target/release/zls --version
 ./target/release/zls week
 ./target/release/zls week --weeks-ago 1
 ./target/release/zls week --weeks-ago 1 --json
@@ -103,13 +104,18 @@ Weekly reports always show Monday through Sunday, including days without complet
 
 ## Task documentation
 
-Each task can own one Markdown document under the configured `[docs] path`. The document is created lazily as `<task-id>.md`, linked explicitly from the task metadata, and never rewritten by ZLS after creation.
+Each task can own one Markdown document under the configured `[docs] path`. The document is created lazily as `<task-id>.md` and linked explicitly from the task metadata. Interactive edits use `$VISUAL` or `$EDITOR`; automation can replace or append exact non-empty file/stdin content without launching an editor.
 
 ```console
 ./target/release/zls docs edit 1
+./target/release/zls docs set TASK_ID --file notes.md
+./target/release/zls docs append TASK_ID --file update.md
+printf '## Update\n\nDone.\n' | ./target/release/zls docs append TASK_ID --stdin
 ./target/release/zls docs show TASK_ID
 ./target/release/zls docs path TASK_ID
 ```
+
+To use a non-default task store and file input together, put the task-file option before the subcommand: `zls --file tasks.md docs set TASK_ID --file notes.md`.
 
 For AI tools, `context` emits JSON containing the local task, its complete documentation, and its Jira correlation. Use `--format markdown` for readable output or `--jira` to fetch current issue details without comments. The default command makes no network requests.
 

@@ -6,6 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use tempfile::NamedTempFile;
+
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     jira::JiraConfig,
@@ -86,6 +90,33 @@ pub fn edit_document(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn write_document(path: &Path, content: &str, append: bool) -> Result<()> {
+    reject_symlink(path)?;
+    if append {
+        let mut options = fs::OpenOptions::new();
+        options.append(true);
+        #[cfg(target_os = "linux")]
+        options.custom_flags(0o400000); // O_NOFOLLOW on Linux.
+        return options
+            .open(path)
+            .and_then(|mut file| file.write_all(content.as_bytes()))
+            .with_context(|| format!("failed to append documentation at {}", path.display()));
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let permissions = fs::metadata(path)?.permissions();
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().set_permissions(permissions)?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .map(|_| ())
+        .with_context(|| format!("failed to replace documentation at {}", path.display()))
+}
+
 fn document_path(root: &Path, link: &str) -> Result<PathBuf> {
     let relative = Path::new(link);
     let mut components = relative.components();
@@ -157,6 +188,18 @@ mod tests {
     }
 
     #[test]
+    fn sets_and_appends_document_content_exactly() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (path, _) = ensure_document(directory.path(), &entry(), None)?;
+
+        write_document(&path, "replacement", false)?;
+        write_document(&path, "\naddition\n", true)?;
+
+        assert_eq!(fs::read_to_string(path)?, "replacement\naddition\n");
+        Ok(())
+    }
+
+    #[test]
     fn rejects_links_outside_the_document_root() {
         assert!(document_path(Path::new("/tmp/docs"), "../secret.md").is_err());
         assert!(document_path(Path::new("/tmp/docs"), "nested/task.md").is_err());
@@ -175,6 +218,8 @@ mod tests {
         symlink(&outside, docs.join("abc12345.md"))?;
 
         assert!(ensure_document(&docs, &entry(), None).is_err());
+        assert!(write_document(&docs.join("abc12345.md"), "overwrite", false).is_err());
+        assert!(write_document(&docs.join("abc12345.md"), "append", true).is_err());
         Ok(())
     }
 }

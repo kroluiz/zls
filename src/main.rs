@@ -14,17 +14,17 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use config::AppConfig;
 use store::{Entry, Store, WeekReport, today};
 
 #[derive(Parser)]
-#[command(about = "A popup-first, Markdown-backed daily task list")]
+#[command(version, about = "A popup-first, Markdown-backed daily task list")]
 struct Cli {
     /// Temporarily override the configured task file
-    #[arg(long, global = true)]
+    #[arg(long)]
     file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Action>,
@@ -109,10 +109,33 @@ enum BacklogAction {
 enum DocsAction {
     /// Open task documentation in VISUAL or EDITOR
     Edit { task: String },
+    /// Replace task documentation from a file or stdin
+    Set {
+        task: String,
+        #[command(flatten)]
+        input: DocumentInput,
+    },
+    /// Append to task documentation from a file or stdin
+    Append {
+        task: String,
+        #[command(flatten)]
+        input: DocumentInput,
+    },
     /// Print task documentation
     Show { task: String },
     /// Print the path to existing task documentation
     Path { task: String },
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct DocumentInput {
+    /// Read documentation from a file
+    #[arg(long = "file", value_name = "PATH")]
+    input_file: Option<PathBuf>,
+    /// Read documentation from stdin
+    #[arg(long)]
+    stdin: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -310,6 +333,24 @@ fn read_comment_input(
     Ok(body)
 }
 
+fn read_document_input(input: DocumentInput) -> Result<String> {
+    let content = if let Some(path) = input.input_file {
+        let path = expand_home(path);
+        fs::read_to_string(&path)
+            .with_context(|| format!("failed to read documentation from {}", path.display()))?
+    } else if input.stdin {
+        let mut content = String::new();
+        io::stdin().read_to_string(&mut content)?;
+        content
+    } else {
+        unreachable!("clap requires --file or --stdin")
+    };
+    if content.trim().is_empty() {
+        bail!("documentation must not be empty");
+    }
+    Ok(content)
+}
+
 fn print_task_context(context: &TaskContext, format: ContextFormat) -> Result<()> {
     match format {
         ContextFormat::Json => println!("{}", serde_json::to_string_pretty(context)?),
@@ -441,6 +482,18 @@ fn run() -> Result<()> {
                 let entry = store.entry(&task, true)?;
                 let path = ensure_task_document(&mut store, &entry, &docs_path)?;
                 docs::edit_document(&path)
+            }
+            DocsAction::Set { task, input } => {
+                let content = read_document_input(input)?;
+                let entry = store.entry(&task, true)?;
+                let path = ensure_task_document(&mut store, &entry, &docs_path)?;
+                docs::write_document(&path, &content, false)
+            }
+            DocsAction::Append { task, input } => {
+                let content = read_document_input(input)?;
+                let entry = store.entry(&task, true)?;
+                let path = ensure_task_document(&mut store, &entry, &docs_path)?;
+                docs::write_document(&path, &content, true)
             }
             DocsAction::Show { task } => {
                 let entry = store.entry(&task, true)?;
@@ -613,7 +666,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_jira_comment_from_text_or_file() -> Result<()> {
+    fn reads_cli_input_from_text_or_file() -> Result<()> {
         assert_eq!(
             read_comment_input(Some("direct comment".to_owned()), None, false)?,
             "direct comment"
@@ -628,6 +681,45 @@ mod tests {
         );
         assert!(read_comment_input(None, None, false).is_err());
         assert!(read_comment_input(Some("text".to_owned()), None, true).is_err());
+
+        let document = directory.path().join("document.md");
+        fs::write(&document, "documentation\n")?;
+        assert_eq!(
+            read_document_input(DocumentInput {
+                input_file: Some(document.clone()),
+                stdin: false,
+            })?,
+            "documentation\n"
+        );
+        fs::write(&document, " \n")?;
+        assert!(
+            read_document_input(DocumentInput {
+                input_file: Some(document),
+                stdin: false,
+            })
+            .is_err()
+        );
         Ok(())
+    }
+
+    #[test]
+    fn separates_task_and_document_file_arguments() {
+        let cli = Cli::try_parse_from([
+            "zls", "--file", "tasks.md", "docs", "set", "abc12345", "--file", "notes.md",
+        ])
+        .expect("task and document files should parse");
+        assert_eq!(cli.file, Some(PathBuf::from("tasks.md")));
+        assert!(matches!(
+            cli.command,
+            Some(Action::Docs {
+                command: DocsAction::Set {
+                    input: DocumentInput {
+                        input_file: Some(path),
+                        stdin: false,
+                    },
+                    ..
+                }
+            }) if path == Path::new("notes.md")
+        ));
     }
 }
