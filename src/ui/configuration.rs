@@ -124,7 +124,6 @@ pub(super) struct State {
     config_path: String,
     task_path: String,
     docs_path: String,
-    jira_config: Option<JiraConfig>,
     accent: Color,
     accent_hex: String,
     accent_original: String,
@@ -146,7 +145,6 @@ impl Default for State {
             String::new(),
             String::new(),
             DEFAULT_ACCENT.to_owned(),
-            None,
         )
         .expect("the default accent is valid")
     }
@@ -158,7 +156,6 @@ impl State {
         task_path: String,
         docs_path: String,
         accent_hex: String,
-        jira_config: Option<JiraConfig>,
     ) -> Result<Self> {
         let (connection_sender, connection_receiver) = mpsc::channel();
         Ok(Self {
@@ -166,7 +163,6 @@ impl State {
             config_path,
             task_path,
             docs_path,
-            jira_config,
             accent: accent_color(&accent_hex)?,
             accent_selected: ACCENT_PRESETS
                 .iter()
@@ -185,14 +181,6 @@ impl State {
 
     pub(super) fn accent(&self) -> Color {
         self.accent
-    }
-
-    pub(super) fn jira_config(&self) -> Option<&JiraConfig> {
-        self.jira_config.as_ref()
-    }
-
-    pub(super) fn set_jira_config(&mut self, config: JiraConfig) {
-        self.jira_config = Some(config);
     }
 
     pub(super) fn set_width(&mut self, width: u16) {
@@ -422,7 +410,12 @@ impl State {
     }
 }
 
-pub(super) fn draw_overview(frame: &mut Frame, state: &State, jira_error: Option<&str>) {
+pub(super) fn draw_overview(
+    frame: &mut Frame,
+    state: &State,
+    config: Option<&JiraConfig>,
+    jira_error: Option<&str>,
+) {
     let area = centered_fixed(frame.area(), 70, 19);
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -462,7 +455,6 @@ pub(super) fn draw_overview(frame: &mut Frame, state: &State, jira_error: Option
         Line::raw(""),
         section_separator("JIRA", inner.width),
     ];
-    let config = state.jira_config.as_ref();
     let connection = match &state.connection_status {
         JiraConnectionStatus::NotChecked if jira_error.is_some() || config.is_none() => {
             "Unavailable".to_owned()
@@ -699,7 +691,6 @@ mod tests {
             String::new(),
             String::new(),
             DEFAULT_ACCENT.to_owned(),
-            None,
         )
         .unwrap()
     }
@@ -760,12 +751,6 @@ mod tests {
     #[test]
     fn every_configuration_row_is_selectable() {
         let mut state = state();
-        state.jira_config = Some(JiraConfig {
-            site: "https://example.atlassian.net".to_owned(),
-            email: "user@example.com".to_owned(),
-            cloud_id: "cloud-id".to_owned(),
-            project: Some("OBS".to_owned()),
-        });
 
         for expected in 1..=CONFIG_LAST_WITH_JIRA {
             state.handle_overview(KeyCode::Down, None, None);
@@ -796,16 +781,16 @@ mod tests {
             "/home/user/a/very/long/task/storage/path/todo.md".to_owned(),
             "/home/user/a/very/long/documentation/storage/path".to_owned(),
             DEFAULT_ACCENT.to_owned(),
-            Some(JiraConfig {
-                site: "https://example.atlassian.net".to_owned(),
-                email: "user@example.com".to_owned(),
-                cloud_id: "cloud-id".to_owned(),
-                project: Some("OBS".to_owned()),
-            }),
         )?;
+        let config = JiraConfig {
+            site: "https://example.atlassian.net".to_owned(),
+            email: "user@example.com".to_owned(),
+            cloud_id: "cloud-id".to_owned(),
+            project: Some("OBS".to_owned()),
+        };
         state.selected = CONFIG_PROJECT;
 
-        terminal.draw(|frame| draw_overview(frame, &state, None))?;
+        terminal.draw(|frame| draw_overview(frame, &state, Some(&config), None))?;
         let rendered = terminal
             .backend()
             .buffer()
@@ -840,7 +825,7 @@ mod tests {
         state.selected = CONFIG_TEST_JIRA;
         state.connection_status = JiraConnectionStatus::Connected("Test User".to_owned());
 
-        terminal.draw(|frame| draw_overview(frame, &state, None))?;
+        terminal.draw(|frame| draw_overview(frame, &state, None, None))?;
         let rendered = terminal
             .backend()
             .buffer()
@@ -891,7 +876,9 @@ mod tests {
             "Jira authentication failed because the API token was rejected".to_owned(),
         );
 
-        terminal.draw(|frame| draw_overview(frame, &state, Some("authentication failed")))?;
+        terminal.draw(|frame| {
+            draw_overview(frame, &state, None, Some("authentication failed"));
+        })?;
         let rendered = terminal
             .backend()
             .buffer()

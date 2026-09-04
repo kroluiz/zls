@@ -55,7 +55,6 @@ pub(super) struct Action {
     pub(super) mode: Option<ModeIntent>,
     pub(super) notice: Option<String>,
     pub(super) store: Option<StoreEffect>,
-    pub(super) config: Option<jira_api::JiraConfig>,
 }
 
 impl Action {
@@ -75,6 +74,7 @@ impl Action {
 }
 
 pub(super) struct State {
+    config: Option<jira_api::JiraConfig>,
     client: Option<jira_api::JiraClient>,
     startup_error: Option<String>,
     sender: Sender<Event>,
@@ -103,16 +103,23 @@ pub(super) struct State {
 
 impl State {
     pub(super) fn new() -> Self {
-        let (client, startup_error) = match jira_api::JiraClient::from_config() {
-            Ok(client) => (Some(client), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        Self::with_client(client, startup_error)
+        match jira_api::JiraConfig::load() {
+            Ok(config) => match jira_api::JiraClient::from_config_snapshot(config.clone()) {
+                Ok(client) => Self::with_client(Some(config), Some(client), None),
+                Err(error) => Self::with_client(Some(config), None, Some(error.to_string())),
+            },
+            Err(error) => Self::with_client(None, None, Some(error.to_string())),
+        }
     }
 
-    fn with_client(client: Option<jira_api::JiraClient>, startup_error: Option<String>) -> Self {
+    fn with_client(
+        config: Option<jira_api::JiraConfig>,
+        client: Option<jira_api::JiraClient>,
+        startup_error: Option<String>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
+            config,
             client,
             startup_error,
             sender,
@@ -142,7 +149,12 @@ impl State {
 
     #[cfg(test)]
     pub(super) fn test_default() -> Self {
-        Self::with_client(None, None)
+        Self::with_client(None, None, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_with_config(config: jira_api::JiraConfig) -> Self {
+        Self::with_client(Some(config), None, Some("unavailable".to_owned()))
     }
 
     pub(super) fn client(&self) -> Option<&jira_api::JiraClient> {
@@ -150,17 +162,11 @@ impl State {
     }
 
     pub(super) fn config(&self) -> Option<&jira_api::JiraConfig> {
-        self.client.as_ref().map(jira_api::JiraClient::config)
+        self.config.as_ref()
     }
 
     pub(super) fn startup_error(&self) -> Option<&str> {
         self.startup_error.as_deref()
-    }
-
-    pub(super) fn loaded_config(&self) -> Option<jira_api::JiraConfig> {
-        self.config()
-            .cloned()
-            .or_else(|| jira_api::JiraConfig::load().ok())
     }
 
     pub(super) fn reset_scroll(&mut self) {
@@ -212,14 +218,18 @@ impl State {
     }
 
     pub(super) fn open_search(&mut self, task_id: String) -> Action {
-        let Some(client) = self.client.as_ref() else {
+        if self.client.is_none() {
             return Action::notice(
                 self.startup_error
                     .as_deref()
                     .unwrap_or("Jira is unavailable"),
             );
-        };
-        if client.config().project.is_none() {
+        }
+        if self
+            .config()
+            .and_then(|config| config.project.as_ref())
+            .is_none()
+        {
             return Action::notice("Select JIRA.Project in Configuration first (g)");
         }
         self.search_task_id = Some(task_id);
@@ -325,7 +335,6 @@ impl State {
                         task_id,
                         issue_key: issue.key.clone(),
                     }),
-                    config: None,
                 }
             }
             KeyCode::Char('i') if !self.search_results.is_empty() => {
@@ -338,7 +347,6 @@ impl State {
                         summary: issue.summary.clone(),
                         issue_key: issue.key.clone(),
                     }),
-                    config: None,
                 }
             }
             KeyCode::Backspace => {
@@ -377,14 +385,13 @@ impl State {
                     return Ok(Action::default());
                 };
                 client.set_project(&project.key)?;
-                let config = client.config().clone();
+                self.config = Some(client.config().clone());
                 let notice = format!("Jira project set to {} ({})", project.key, project.name);
                 self.search_results.clear();
                 Action {
                     mode: Some(ModeIntent::Configuration),
                     notice: Some(notice),
                     store: None,
-                    config: Some(config),
                 }
             }
             _ => Action::default(),
@@ -567,9 +574,8 @@ impl State {
                             self.project_error = false;
                             self.project_results = projects;
                             self.project_selected = self
-                                .client
-                                .as_ref()
-                                .and_then(|client| client.config().project.as_deref())
+                                .config()
+                                .and_then(|config| config.project.as_deref())
                                 .and_then(|selected| {
                                     self.project_results
                                         .iter()
@@ -1018,7 +1024,27 @@ mod tests {
     use super::*;
 
     fn state() -> State {
-        State::with_client(None, Some("unavailable".to_owned()))
+        State::with_client(None, None, Some("unavailable".to_owned()))
+    }
+
+    #[test]
+    fn loaded_config_is_retained_without_a_client() {
+        let config = jira_api::JiraConfig {
+            site: "https://example.atlassian.net".to_owned(),
+            email: "user@example.com".to_owned(),
+            cloud_id: "cloud-id".to_owned(),
+            project: Some("APP".to_owned()),
+        };
+
+        let state = State::with_client(
+            Some(config.clone()),
+            None,
+            Some("missing Jira token".to_owned()),
+        );
+
+        assert_eq!(state.config(), Some(&config));
+        assert!(state.client().is_none());
+        assert_eq!(state.startup_error(), Some("missing Jira token"));
     }
 
     #[test]

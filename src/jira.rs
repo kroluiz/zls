@@ -184,6 +184,10 @@ struct ConfigFile {
 impl JiraClient {
     pub fn from_config() -> Result<Self> {
         let config = JiraConfig::load()?;
+        Self::from_config_snapshot(config)
+    }
+
+    pub(crate) fn from_config_snapshot(config: JiraConfig) -> Result<Self> {
         let token = load_token(&config)?;
         Self::new(config, token)
     }

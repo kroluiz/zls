@@ -110,7 +110,6 @@ fn run_loop(
         store.path().display().to_string(),
         docs_path.display().to_string(),
         config.ui.accent.clone(),
-        jira.loaded_config(),
     )?;
     let mut state = State::new(configuration, jira);
     let carried = store.carry()?;
@@ -383,9 +382,6 @@ fn apply_jira_action(action: jira::Action, state: &mut State, store: &mut Store)
             }
         }
     }
-    if let Some(config) = action.config {
-        state.configuration.set_jira_config(config);
-    }
     if let Some(message) = action.notice {
         state.message = message;
     }
@@ -420,8 +416,7 @@ fn edit_selected_document(
         return Ok(());
     };
     let prepared = (|| -> Result<_> {
-        let (path, link) =
-            docs::ensure_document(docs_path, entry, state.configuration.jira_config())?;
+        let (path, link) = docs::ensure_document(docs_path, entry, state.jira.config())?;
         if entry.task.doc.is_none() {
             store.link_document(&entry.task.id, &link)?;
         }
@@ -503,9 +498,12 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
 
     match state.mode {
         Mode::Help => state.help.draw(frame, state.configuration.accent()),
-        Mode::Configuration => {
-            configuration::draw_overview(frame, &state.configuration, state.jira.startup_error())
-        }
+        Mode::Configuration => configuration::draw_overview(
+            frame,
+            &state.configuration,
+            state.jira.config(),
+            state.jira.startup_error(),
+        ),
         Mode::AccentPalette => configuration::draw_accent(frame, &state.configuration),
         Mode::AccentCustom => configuration::draw_custom_accent(frame, &state.configuration),
         Mode::Search => jira::draw_search(frame, &state.jira, state.configuration.accent()),
@@ -540,6 +538,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn configuration_opens_and_closes_without_leaving_week_view() -> Result<()> {
@@ -673,6 +672,32 @@ mod tests {
     }
 
     #[test]
+    fn jira_project_reaches_configuration_without_action_propagation() -> Result<()> {
+        let jira = jira::State::test_with_config(crate::jira::JiraConfig {
+            site: "https://example.atlassian.net".to_owned(),
+            email: "user@example.com".to_owned(),
+            cloud_id: "cloud-id".to_owned(),
+            project: Some("ROOT".to_owned()),
+        });
+        let mut state = State::new(configuration::State::default(), jira);
+        state.mode = Mode::Configuration;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend)?;
+
+        terminal.draw(|frame| draw(frame, &[], &state, None))?;
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("ROOT"));
+        Ok(())
+    }
+
+    #[test]
     fn jira_effects_are_applied_to_root_and_store() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::load(directory.path().join("todo.md"))?;
@@ -685,7 +710,6 @@ mod tests {
                 task_id: task.id,
                 issue_key: "APP-9".to_owned(),
             }),
-            config: None,
         };
 
         apply_jira_action(action, &mut state, &mut store)?;
@@ -702,7 +726,6 @@ mod tests {
                     summary: "Imported task".to_owned(),
                     issue_key: "APP-10".to_owned(),
                 }),
-                config: None,
             },
             &mut state,
             &mut store,
