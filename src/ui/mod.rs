@@ -6,6 +6,7 @@ use std::{
 
 mod configuration;
 mod jira;
+mod tasks;
 mod week;
 
 use anyhow::Result;
@@ -20,27 +21,23 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::{
     config::{AppConfig, config_path},
     docs,
     keybindings::{KEYBINDINGS, Section, compact_hint},
-    store::{BACKLOG, Entry, Store, WeekReport, today, tomorrow},
+    store::{Entry, Store, WeekReport},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
-    Add,
-    AddBacklog,
-    Move,
     Help,
     Configuration,
     AccentPalette,
     AccentCustom,
-    TaskSearch,
     Search,
     Project,
     Transition,
@@ -49,40 +46,30 @@ enum Mode {
 }
 
 struct State {
-    selected: usize,
-    show_history: bool,
-    show_backlog: bool,
     jira_tab: bool,
     mode: Mode,
     overlay_return: Mode,
-    input: String,
     message: String,
     jira: jira::State,
-    move_selected: usize,
     help_scroll: u16,
     configuration: configuration::State,
-    task_query: String,
     edit_document: bool,
+    tasks: tasks::State,
     week: week::State,
 }
 
 impl State {
     fn new(configuration: configuration::State, jira: jira::State) -> Self {
         Self {
-            selected: 0,
-            show_history: false,
-            show_backlog: false,
             jira_tab: false,
             mode: Mode::Normal,
             overlay_return: Mode::Normal,
-            input: String::new(),
             message: String::new(),
             jira,
-            move_selected: 0,
             help_scroll: 0,
             configuration,
-            task_query: String::new(),
             edit_document: false,
+            tasks: tasks::State::default(),
             week: week::State::default(),
         }
     }
@@ -141,26 +128,18 @@ fn run_loop(
             state.message = message;
         }
         let week_report = state.week.report(store)?;
-        let entries = week_report.as_ref().map_or_else(
-            || {
-                entries(
-                    store,
-                    state.show_history,
-                    state.show_backlog,
-                    &state.task_query,
-                )
-            },
-            WeekReport::entries,
-        );
+        let entries = week_report
+            .as_ref()
+            .map_or_else(|| state.tasks.entries(store), WeekReport::entries);
         if state.week.is_active() {
             state.week.clamp_selection(entries.len());
         } else {
-            state.selected = state.selected.min(entries.len().saturating_sub(1));
+            state.tasks.clamp_selection(entries.len());
         }
         let selected = if state.week.is_active() {
             state.week.selected()
         } else {
-            state.selected
+            state.tasks.selected()
         };
         let selected_issue = entries
             .get(selected)
@@ -182,9 +161,6 @@ fn run_loop(
         }
 
         match state.mode {
-            Mode::Add => handle_add_key(key.code, &mut state, store, false)?,
-            Mode::AddBacklog => handle_add_key(key.code, &mut state, store, true)?,
-            Mode::Move => handle_move_key(key.code, &entries, &mut state, store)?,
             Mode::Help => handle_help_key(key.code, &mut state),
             Mode::Configuration => apply_configuration_action(
                 configuration::State::handle_overview(
@@ -208,7 +184,6 @@ fn run_loop(
                 &mut state,
                 store,
             )?,
-            Mode::TaskSearch => handle_task_search_key(key.code, &mut state),
             Mode::Search => {
                 let action = state.jira.handle_search_key(key.code);
                 apply_jira_action(action, &mut state, store)?;
@@ -236,7 +211,7 @@ fn run_loop(
                 }
             }
             Mode::Normal => {
-                if handle_normal_key(key.code, &entries, &mut state, store)? {
+                if handle_task_key(key.code, &entries, &mut state, store)? {
                     return Ok(());
                 }
             }
@@ -248,97 +223,53 @@ fn run_loop(
     }
 }
 
-fn handle_normal_key(
+fn handle_task_key(
     key: KeyCode,
     entries: &[Entry],
     state: &mut State,
     store: &mut Store,
 ) -> Result<bool> {
-    let selected_task_id = entries
-        .get(state.selected)
-        .map(|entry| entry.task.id.as_str());
-    if let Some(action) = state.jira.handle_normal_key(key, selected_task_id) {
-        apply_jira_action(action, state, store)?;
-        return Ok(false);
-    }
-    match key {
-        KeyCode::Char('q') => return Ok(true),
-        KeyCode::Esc if !state.task_query.is_empty() => {
-            state.task_query.clear();
-            state.selected = 0;
+    if state.tasks.is_normal() {
+        let selected_task_id = state.tasks.selected_task_id(entries);
+        if let Some(action) = state.jira.handle_normal_key(key, selected_task_id) {
+            apply_jira_action(action, state, store)?;
+            return Ok(false);
         }
-        KeyCode::Esc => return Ok(true),
-        KeyCode::Char('W') => {
+    }
+    let action = state.tasks.handle_key(key, entries, store)?;
+    Ok(match action {
+        tasks::Action::None => false,
+        tasks::Action::Quit => true,
+        tasks::Action::OpenWeek => {
             state.week.open();
-            state.selected = 0;
             state.jira_tab = false;
-            state.task_query.clear();
+            false
         }
-        KeyCode::Char('/') => {
-            state.mode = Mode::TaskSearch;
-            state.selected = 0;
+        tasks::Action::JiraTogglePane => {
+            state.jira_tab = !state.jira_tab;
+            false
         }
-        KeyCode::Char('e') if !entries.is_empty() => state.edit_document = true,
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.selected = state.selected.saturating_sub(1);
+        tasks::Action::JiraResetScroll => {
             state.jira.reset_scroll();
+            false
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.selected = (state.selected + 1).min(entries.len().saturating_sub(1));
-            state.jira.reset_scroll();
+        tasks::Action::JiraScrollDown => {
+            state.jira.scroll_down();
+            false
         }
-        KeyCode::Tab => state.jira_tab = !state.jira_tab,
-        KeyCode::PageDown => state.jira.scroll_down(),
-        KeyCode::PageUp => state.jira.scroll_up(),
-        KeyCode::Char('a') => {
-            state.mode = Mode::Add;
-            state.input.clear();
+        tasks::Action::JiraScrollUp => {
+            state.jira.scroll_up();
+            false
         }
-        KeyCode::Char('B') => {
-            state.mode = Mode::AddBacklog;
-            state.input.clear();
+        tasks::Action::EditDocument => {
+            state.edit_document = true;
+            false
         }
-        KeyCode::Char('b') => {
-            state.show_backlog = !state.show_backlog;
-            state.message = if state.show_backlog {
-                "Backlog visible".to_owned()
-            } else {
-                "Backlog hidden".to_owned()
-            };
+        tasks::Action::Notice(message) => {
+            state.message = message;
+            false
         }
-        KeyCode::Char('p') if !entries.is_empty() => {
-            let entry = &entries[state.selected];
-            if entry.date == BACKLOG {
-                store.promote_backlog(&entry.task.id)?;
-                state.message = "Moved backlog task into today".to_owned();
-            } else {
-                state.message = "Select a backlog task to promote".to_owned();
-            }
-        }
-        KeyCode::Char('M') if !entries.is_empty() => {
-            state.mode = Mode::Move;
-            state.move_selected = 0;
-        }
-        KeyCode::Char(' ') | KeyCode::Char('d') if !entries.is_empty() => {
-            let task = &entries[state.selected].task;
-            let completed = !task.completed;
-            store.set_completed(&task.id, false, completed)?;
-            state.message = if completed { "Completed" } else { "Reopened" }.to_owned();
-        }
-        KeyCode::Char('h') => {
-            state.show_history = !state.show_history;
-            state.selected = 0;
-            state.message.clear();
-        }
-        KeyCode::Char('C') => {
-            let count = store.carry()?;
-            state.show_history = false;
-            state.selected = 0;
-            state.message = format!("Carried {count} task{}", if count == 1 { "" } else { "s" });
-        }
-        _ => {}
-    }
-    Ok(false)
+    })
 }
 
 fn apply_week_action(action: week::Action, state: &mut State) -> bool {
@@ -346,7 +277,7 @@ fn apply_week_action(action: week::Action, state: &mut State) -> bool {
         week::Action::None => {}
         week::Action::Quit => return true,
         week::Action::Close => {
-            state.selected = 0;
+            state.tasks.reset_selection();
             state.jira_tab = false;
         }
         week::Action::JiraFocus => state.jira_tab = true,
@@ -358,67 +289,6 @@ fn apply_week_action(action: week::Action, state: &mut State) -> bool {
         week::Action::EditDocument => state.edit_document = true,
     }
     false
-}
-
-fn handle_add_key(key: KeyCode, state: &mut State, store: &mut Store, backlog: bool) -> Result<()> {
-    match key {
-        KeyCode::Enter => {
-            if !state.input.trim().is_empty() {
-                if backlog {
-                    store.add_backlog(&state.input)?;
-                    state.message = "Backlog task added".to_owned();
-                    state.show_backlog = true;
-                } else {
-                    store.add(&state.input)?;
-                    state.message = "Task added".to_owned();
-                    state.show_history = false;
-                }
-            }
-            state.input.clear();
-            state.mode = Mode::Normal;
-        }
-        KeyCode::Esc => {
-            state.input.clear();
-            state.mode = Mode::Normal;
-        }
-        KeyCode::Backspace => {
-            state.input.pop();
-        }
-        KeyCode::Char(character) => state.input.push(character),
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_move_key(
-    key: KeyCode,
-    entries: &[Entry],
-    state: &mut State,
-    store: &mut Store,
-) -> Result<()> {
-    match key {
-        KeyCode::Esc => state.mode = Mode::Normal,
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.move_selected = state.move_selected.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.move_selected = (state.move_selected + 1).min(2);
-        }
-        KeyCode::Enter => {
-            if let Some(entry) = entries.get(state.selected) {
-                let destination = match state.move_selected {
-                    0 => "today",
-                    1 => "tomorrow",
-                    _ => "backlog",
-                };
-                store.move_task(&entry.task.id, destination, false)?;
-                state.message = format!("Moved task to {destination}");
-                state.mode = Mode::Normal;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn handle_help_key(key: KeyCode, state: &mut State) {
@@ -445,20 +315,18 @@ fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
         KeyCode::Char('?')
             if !matches!(
                 state.mode,
-                Mode::Add
-                    | Mode::AddBacklog
-                    | Mode::AccentCustom
-                    | Mode::TaskSearch
-                    | Mode::Search
-                    | Mode::Comment
+                Mode::AccentCustom | Mode::Search | Mode::Comment
             ) =>
         {
+            if state.tasks.captures_text() {
+                return false;
+            }
             state.overlay_return = state.mode;
             state.help_scroll = 0;
             state.mode = Mode::Help;
             true
         }
-        KeyCode::Char('g') if state.mode == Mode::Normal => {
+        KeyCode::Char('g') if state.mode == Mode::Normal && state.tasks.is_normal() => {
             state.mode = Mode::Configuration;
             if let Some(message) = state
                 .configuration
@@ -511,7 +379,7 @@ fn apply_jira_action(action: jira::Action, state: &mut State, store: &mut Store)
             }
             jira::StoreEffect::Import { summary, issue_key } => {
                 store.add_linked(&summary, Some(&issue_key))?;
-                state.show_history = false;
+                state.tasks.show_today();
             }
             jira::StoreEffect::Unlink { task_id } => {
                 store.unlink_jira(&task_id)?;
@@ -538,26 +406,6 @@ fn apply_jira_action(action: jira::Action, state: &mut State, store: &mut Store)
     Ok(())
 }
 
-fn handle_task_search_key(key: KeyCode, state: &mut State) {
-    match key {
-        KeyCode::Enter => state.mode = Mode::Normal,
-        KeyCode::Esc => {
-            state.task_query.clear();
-            state.selected = 0;
-            state.mode = Mode::Normal;
-        }
-        KeyCode::Backspace => {
-            state.task_query.pop();
-            state.selected = 0;
-        }
-        KeyCode::Char(character) => {
-            state.task_query.push(character);
-            state.selected = 0;
-        }
-        _ => {}
-    }
-}
-
 fn edit_selected_document(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     entries: &[Entry],
@@ -568,7 +416,7 @@ fn edit_selected_document(
     let selected = if state.week.is_active() {
         state.week.selected()
     } else {
-        state.selected
+        state.tasks.selected()
     };
     let Some(entry) = entries.get(selected) else {
         state.message = "Select a task to document".to_owned();
@@ -607,44 +455,6 @@ fn edit_selected_document(
     Ok(())
 }
 
-fn entries(store: &Store, show_history: bool, show_backlog: bool, query: &str) -> Vec<Entry> {
-    let entries = if show_history {
-        let all = store.entries_all().into_iter().collect::<Vec<_>>();
-        let mut entries = all
-            .iter()
-            .filter(|entry| entry.date != BACKLOG)
-            .cloned()
-            .collect::<Vec<_>>();
-        if show_backlog {
-            entries.extend(all.into_iter().filter(|entry| entry.date == BACKLOG));
-        }
-        entries
-    } else {
-        let mut entries = store.entries_today();
-        if show_backlog {
-            entries.extend(store.entries_backlog());
-        }
-        entries
-    };
-    entries
-        .into_iter()
-        .filter(|entry| task_matches(entry, query))
-        .collect()
-}
-
-fn task_matches(entry: &Entry, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || entry.task.text.to_lowercase().contains(&query)
-        || entry.task.id.to_lowercase().contains(&query)
-        || entry.date.to_lowercase().contains(&query)
-        || entry
-            .task
-            .jira
-            .as_ref()
-            .is_some_and(|key| key.to_lowercase().contains(&query))
-}
-
 fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option<&WeekReport>) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -670,7 +480,7 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
                 state.configuration.accent(),
             );
         } else {
-            draw_tasks(frame, panes[0], entries, state);
+            state.tasks.draw(frame, panes[0], entries);
         }
         jira::draw_card(frame, panes[1], &state.jira, state.configuration.accent());
     } else if state.jira_tab {
@@ -685,7 +495,7 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
                 state.configuration.accent(),
             );
         } else {
-            draw_tasks(frame, areas[1], entries, state);
+            state.tasks.draw(frame, areas[1], entries);
         }
     }
 
@@ -695,40 +505,27 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
     );
 
     match state.mode {
-        Mode::Add => draw_single_input(frame, "New task", &state.input),
-        Mode::AddBacklog => draw_single_input(frame, "New backlog task", &state.input),
-        Mode::Move => draw_move_selector(frame, state),
         Mode::Help => draw_help(frame, state),
         Mode::Configuration => {
             configuration::draw_overview(frame, &state.configuration, state.jira.startup_error())
         }
         Mode::AccentPalette => configuration::draw_accent(frame, &state.configuration),
         Mode::AccentCustom => configuration::draw_custom_accent(frame, &state.configuration),
-        Mode::TaskSearch => draw_single_input(
-            frame,
-            "Search tasks / Enter keep / Esc clear",
-            &state.task_query,
-        ),
         Mode::Search => jira::draw_search(frame, &state.jira, state.configuration.accent()),
         Mode::Project => jira::draw_project(frame, &state.jira, state.configuration.accent()),
         Mode::Transition => jira::draw_transition(frame, &state.jira),
         Mode::Comment => jira::draw_comment(frame, &state.jira),
         Mode::ConfirmComment => jira::draw_comment_confirmation(frame, &state.jira),
-        Mode::Normal => {}
+        Mode::Normal => state.tasks.draw_dialog(frame),
     }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option<&WeekReport>) {
-    let mut title = if let Some(report) = week_report {
+    let title = if let Some(report) = week_report {
         week::title(report)
-    } else if state.show_history {
-        "ZLS / HISTORY".to_owned()
     } else {
-        format!("ZLS / TODAY / {}", today())
+        state.tasks.title()
     };
-    if !state.task_query.is_empty() {
-        title.push_str(&format!(" / SEARCH: {}", state.task_query));
-    }
     let hint = if week_report.is_some() {
         week::HINT.to_owned()
     } else {
@@ -741,153 +538,6 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
         ]),
         area,
     );
-}
-
-fn draw_tasks(frame: &mut Frame, area: Rect, entries: &[Entry], state: &State) {
-    let regular = entries
-        .iter()
-        .filter(|entry| entry.date != BACKLOG)
-        .collect::<Vec<_>>();
-    let backlog = entries
-        .iter()
-        .filter(|entry| entry.date == BACKLOG)
-        .collect::<Vec<_>>();
-    let selected_id = entries
-        .get(state.selected)
-        .map(|entry| entry.task.id.as_str());
-    let regular_selected =
-        selected_id.and_then(|id| regular.iter().position(|entry| entry.task.id == id));
-    let backlog_selected =
-        selected_id.and_then(|id| backlog.iter().position(|entry| entry.task.id == id));
-
-    let empty_message = if state.task_query.is_empty() {
-        "Nothing here. Press a to add a task.".to_owned()
-    } else {
-        format!("No tasks match /{}", state.task_query)
-    };
-
-    if state.show_backlog {
-        let backlog_height = (backlog.len() as u16 + 2)
-            .max(3)
-            .min(area.height.saturating_sub(3).max(1));
-        let panes = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(backlog_height)])
-            .split(area);
-        draw_task_list(
-            frame,
-            panes[0],
-            &regular,
-            regular_selected,
-            " TASKS ",
-            if state.task_query.is_empty() {
-                "Nothing scheduled for today."
-            } else {
-                &empty_message
-            },
-            state.show_history,
-        );
-        draw_task_list(
-            frame,
-            panes[1],
-            &backlog,
-            backlog_selected,
-            " BACKLOG ",
-            if state.task_query.is_empty() {
-                "Backlog is empty. Press B to add."
-            } else {
-                &empty_message
-            },
-            false,
-        );
-    } else {
-        draw_task_list(
-            frame,
-            area,
-            &regular,
-            regular_selected,
-            " TASKS ",
-            &empty_message,
-            state.show_history,
-        );
-    }
-}
-
-fn draw_task_list(
-    frame: &mut Frame,
-    area: Rect,
-    entries: &[&Entry],
-    selected: Option<usize>,
-    title: &str,
-    empty_message: &str,
-    show_dates: bool,
-) {
-    let items = if entries.is_empty() {
-        vec![ListItem::new(empty_message)]
-    } else {
-        entries
-            .iter()
-            .map(|entry| {
-                let checked = if entry.task.completed { 'x' } else { ' ' };
-                let jira = entry
-                    .task
-                    .jira
-                    .as_ref()
-                    .map_or_else(String::new, |key| format!(" [{key}]"));
-                let docs = if entry.task.doc.is_some() {
-                    " [doc]"
-                } else {
-                    ""
-                };
-                let date = if show_dates {
-                    format!("  {}", entry.date)
-                } else {
-                    String::new()
-                };
-                ListItem::new(format!("[{checked}] {}{jira}{docs}{date}", entry.task.text))
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::TOP | Borders::RIGHT)
-                .title(title),
-        )
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    let mut list_state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(list, area, &mut list_state);
-}
-
-fn draw_single_input(frame: &mut Frame, title: &str, input: &str) {
-    let area = centered_fixed(frame.area(), 70, 3);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(input).block(Block::default().borders(Borders::ALL).title(title)),
-        area,
-    );
-    frame.set_cursor_position((area.x + input.chars().count() as u16 + 1, area.y + 1));
-}
-
-fn draw_move_selector(frame: &mut Frame, state: &State) {
-    let area = centered_fixed(frame.area(), 45, 5);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" MOVE TASK / Enter select / Esc cancel ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let options = [
-        format!("Today     {}", today()),
-        format!("Tomorrow  {}", tomorrow()),
-        "Backlog    no scheduled date".to_owned(),
-    ];
-    let list = List::new(options.into_iter().map(ListItem::new).collect::<Vec<_>>())
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    let mut list_state = ListState::default().with_selected(Some(state.move_selected));
-    frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
 fn draw_help(frame: &mut Frame, state: &State) {
@@ -971,28 +621,6 @@ fn centered_fixed(area: Rect, width_percent: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Task;
-
-    #[test]
-    fn task_search_matches_all_visible_identifiers_case_insensitively() {
-        let entry = Entry {
-            date: "2026-09-02".to_owned(),
-            task: Task {
-                id: "a1B2c3D4".to_owned(),
-                text: "Prepare Smart Factory presentation".to_owned(),
-                completed: false,
-                done: None,
-                jira: Some("MP-396".to_owned()),
-                doc: None,
-            },
-        };
-
-        assert!(task_matches(&entry, "smart factory"));
-        assert!(task_matches(&entry, "mp-396"));
-        assert!(task_matches(&entry, "A1b2"));
-        assert!(task_matches(&entry, "09-02"));
-        assert!(!task_matches(&entry, "unrelated"));
-    }
 
     #[test]
     fn configuration_opens_and_closes_without_leaving_week_view() -> Result<()> {
@@ -1020,19 +648,18 @@ mod tests {
         store.add("first")?;
         store.add("second")?;
         let entries = store.entries_today();
-        let mut state = State {
-            selected: 1,
-            ..State::default()
-        };
+        let mut state = State::default();
 
-        handle_normal_key(KeyCode::Char('W'), &entries, &mut state, &mut store)?;
+        handle_task_key(KeyCode::Down, &entries, &mut state, &mut store)?;
+        assert_eq!(state.tasks.selected(), 1);
+        handle_task_key(KeyCode::Char('W'), &entries, &mut state, &mut store)?;
         state.week.handle_key(KeyCode::Down, 3);
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.tasks.selected(), 0);
         assert_eq!(state.week.selected(), 1);
         let action = state.week.handle_key(KeyCode::Esc, 3);
         apply_week_action(action, &mut state);
 
-        assert_eq!(state.selected, 0);
+        assert_eq!(state.tasks.selected(), 0);
         assert!(!state.week.is_active());
         Ok(())
     }
@@ -1052,13 +679,49 @@ mod tests {
     }
 
     #[test]
-    fn global_overlay_keys_do_not_capture_text_input() {
-        let mut state = State {
-            mode: Mode::Add,
-            ..State::default()
-        };
+    fn global_overlay_keys_do_not_capture_text_input() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        let mut state = State::default();
+        handle_task_key(KeyCode::Char('a'), &[], &mut state, &mut store)?;
 
         assert!(!handle_global_overlay_key(KeyCode::Char('?'), &mut state));
+        Ok(())
+    }
+
+    #[test]
+    fn task_intents_update_root_jira_pane_and_document_effects() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        store.add("task")?;
+        let entries = store.entries_today();
+        let mut state = State::default();
+
+        handle_task_key(KeyCode::Tab, &entries, &mut state, &mut store)?;
+        handle_task_key(KeyCode::Char('e'), &entries, &mut state, &mut store)?;
+
+        assert!(state.jira_tab);
+        assert!(state.edit_document);
+        Ok(())
+    }
+
+    #[test]
+    fn jira_keys_take_precedence_and_use_the_selected_task_id() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        let first = store.add("first")?;
+        let second = store.add("second")?;
+        store.link_jira(&second.id, "APP-2")?;
+        let entries = store.entries_today();
+        let mut state = State::default();
+        handle_task_key(KeyCode::Down, &entries, &mut state, &mut store)?;
+
+        handle_task_key(KeyCode::Char('u'), &entries, &mut state, &mut store)?;
+
+        assert_eq!(store.entry(&first.id, false)?.task.jira, None);
+        assert_eq!(store.entry(&second.id, false)?.task.jira, None);
+        assert_eq!(state.message, "Jira link removed");
+        Ok(())
     }
 
     #[test]
