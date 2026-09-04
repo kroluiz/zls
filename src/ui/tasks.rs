@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::store::{BACKLOG, Entry, Store, today, tomorrow};
 
-use super::centered_fixed;
+use super::layout::centered_fixed;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Action {

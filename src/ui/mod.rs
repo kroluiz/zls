@@ -6,6 +6,7 @@ use std::{
 
 mod configuration;
 mod jira;
+mod layout;
 mod tasks;
 mod week;
 
@@ -30,6 +31,8 @@ use crate::{
     keybindings::{KEYBINDINGS, Section, compact_hint},
     store::{Entry, Store, WeekReport},
 };
+
+use self::layout::centered;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -586,36 +589,6 @@ fn draw_help(frame: &mut Frame, state: &State) {
             .scroll((state.help_scroll, 0)),
         inner,
     );
-}
-
-fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_percent) / 2),
-            Constraint::Percentage(height_percent),
-            Constraint::Percentage((100 - height_percent) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_percent) / 2),
-            Constraint::Percentage(width_percent),
-            Constraint::Percentage((100 - width_percent) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
-fn centered_fixed(area: Rect, width_percent: u16, height: u16) -> Rect {
-    let width = area.width.saturating_mul(width_percent) / 100;
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 #[cfg(test)]

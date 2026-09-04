@@ -8,7 +8,6 @@ use anyhow::Result;
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
-    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -18,6 +17,8 @@ use crate::{
     config::{AppConfig, DEFAULT_ACCENT, parse_hex_color},
     jira::{JiraClient, JiraConfig},
 };
+
+use super::layout::centered_fixed;
 
 struct AccentPreset {
     name: &'static str,
@@ -672,17 +673,6 @@ fn wrap_fixed_width(value: &str, width: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
-}
-
-fn centered_fixed(area: Rect, width_percent: u16, height: u16) -> Rect {
-    let width = area.width.saturating_mul(width_percent) / 100;
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 #[cfg(test)]

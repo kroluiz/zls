@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::jira as jira_api;
 
-use super::{centered, centered_fixed};
+use super::layout::{centered, centered_fixed};
 
 enum Event {
     Card(String, Box<Result<jira_api::IssueCard, String>>),
