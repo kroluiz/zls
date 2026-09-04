@@ -1,5 +1,5 @@
 use std::{
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::Sender,
     thread,
     time::{Duration, Instant},
 };
@@ -18,7 +18,7 @@ use crate::{
     jira::{JiraClient, JiraConfig},
 };
 
-use super::layout::centered_fixed;
+use super::{AsyncEvent, layout::centered_fixed};
 
 struct AccentPreset {
     name: &'static str,
@@ -98,7 +98,7 @@ const CONFIG_TEST_JIRA: usize = 10;
 const CONFIG_LAST_WITH_JIRA: usize = CONFIG_TEST_JIRA;
 const JIRA_CONNECTION_TTL: Duration = Duration::from_secs(5 * 60);
 
-enum ConnectionEvent {
+pub(super) enum Event {
     Result(u64, Instant, Result<String, String>),
 }
 
@@ -133,21 +133,7 @@ pub(super) struct State {
     connection_status: JiraConnectionStatus,
     connection_checked_at: Option<Instant>,
     connection_generation: u64,
-    connection_sender: Sender<ConnectionEvent>,
-    connection_receiver: Receiver<ConnectionEvent>,
-}
-
-#[cfg(test)]
-impl Default for State {
-    fn default() -> Self {
-        Self::new(
-            String::new(),
-            String::new(),
-            String::new(),
-            DEFAULT_ACCENT.to_owned(),
-        )
-        .expect("the default accent is valid")
-    }
+    connection_sender: Sender<AsyncEvent>,
 }
 
 impl State {
@@ -156,8 +142,8 @@ impl State {
         task_path: String,
         docs_path: String,
         accent_hex: String,
+        connection_sender: Sender<AsyncEvent>,
     ) -> Result<Self> {
-        let (connection_sender, connection_receiver) = mpsc::channel();
         Ok(Self {
             selected: 0,
             config_path,
@@ -175,8 +161,19 @@ impl State {
             connection_checked_at: None,
             connection_generation: 0,
             connection_sender,
-            connection_receiver,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_default(sender: Sender<AsyncEvent>) -> Self {
+        Self::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            DEFAULT_ACCENT.to_owned(),
+            sender,
+        )
+        .expect("the default accent is valid")
     }
 
     pub(super) fn accent(&self) -> Color {
@@ -197,27 +194,27 @@ impl State {
             .then(|| self.request_connection_test(jira, jira_error))
     }
 
-    pub(super) fn poll(&mut self) -> Option<String> {
-        let mut message = None;
-        while let Ok(ConnectionEvent::Result(generation, checked_at, result)) =
-            self.connection_receiver.try_recv()
-        {
-            if generation != self.connection_generation {
-                continue;
-            }
-            self.connection_checked_at = Some(checked_at);
-            match result {
-                Ok(display_name) => {
-                    message = Some(format!("Jira connection verified as {display_name}"));
-                    self.connection_status = JiraConnectionStatus::Connected(display_name);
+    pub(super) fn apply_event(&mut self, event: Event) -> Option<String> {
+        match event {
+            Event::Result(generation, checked_at, result) => {
+                if generation != self.connection_generation {
+                    return None;
                 }
-                Err(error) => {
-                    message = Some(error.clone());
-                    self.connection_status = JiraConnectionStatus::Failed(error);
+                self.connection_checked_at = Some(checked_at);
+                match result {
+                    Ok(display_name) => {
+                        let message = format!("Jira connection verified as {display_name}");
+                        self.connection_status = JiraConnectionStatus::Connected(display_name);
+                        Some(message)
+                    }
+                    Err(error) => {
+                        let message = error.clone();
+                        self.connection_status = JiraConnectionStatus::Failed(error);
+                        Some(message)
+                    }
                 }
             }
         }
-        message
     }
 
     pub(super) fn handle_overview(
@@ -404,7 +401,11 @@ impl State {
                 .test_auth()
                 .map(|user| user.display_name)
                 .map_err(|error| error.to_string());
-            let _ = sender.send(ConnectionEvent::Result(generation, Instant::now(), result));
+            let _ = sender.send(AsyncEvent::Configuration(Event::Result(
+                generation,
+                Instant::now(),
+                result,
+            )));
         });
         "Testing Jira connection...".to_owned()
     }
@@ -686,11 +687,13 @@ mod tests {
     }
 
     fn state() -> State {
+        let (sender, _receiver) = std::sync::mpsc::channel();
         State::new(
             String::new(),
             String::new(),
             String::new(),
             DEFAULT_ACCENT.to_owned(),
+            sender,
         )
         .unwrap()
     }
@@ -781,6 +784,7 @@ mod tests {
             "/home/user/a/very/long/task/storage/path/todo.md".to_owned(),
             "/home/user/a/very/long/documentation/storage/path".to_owned(),
             DEFAULT_ACCENT.to_owned(),
+            std::sync::mpsc::channel().0,
         )?;
         let config = JiraConfig {
             site: "https://example.atlassian.net".to_owned(),

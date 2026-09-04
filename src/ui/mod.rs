@@ -1,6 +1,7 @@
 use std::{
     io::{self, stdout},
     path::Path,
+    sync::mpsc::{self, Receiver},
     time::Duration,
 };
 
@@ -47,6 +48,11 @@ enum Mode {
     ConfirmComment,
 }
 
+enum AsyncEvent {
+    Jira(jira::Event),
+    Configuration(configuration::Event),
+}
+
 struct State {
     jira_tab: bool,
     mode: Mode,
@@ -58,10 +64,15 @@ struct State {
     edit_document: bool,
     tasks: tasks::State,
     week: week::State,
+    async_receiver: Receiver<AsyncEvent>,
 }
 
 impl State {
-    fn new(configuration: configuration::State, jira: jira::State) -> Self {
+    fn new(
+        configuration: configuration::State,
+        jira: jira::State,
+        async_receiver: Receiver<AsyncEvent>,
+    ) -> Self {
         Self {
             jira_tab: false,
             mode: Mode::Normal,
@@ -73,14 +84,23 @@ impl State {
             edit_document: false,
             tasks: tasks::State::default(),
             week: week::State::default(),
+            async_receiver,
         }
+    }
+
+    #[cfg(test)]
+    fn test_default() -> (Self, mpsc::Sender<AsyncEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        let configuration = configuration::State::test_default(sender.clone());
+        let jira = jira::State::test_default(sender.clone());
+        (Self::new(configuration, jira, receiver), sender)
     }
 }
 
 #[cfg(test)]
 impl Default for State {
     fn default() -> Self {
-        Self::new(configuration::State::default(), jira::State::test_default())
+        Self::test_default().0
     }
 }
 
@@ -104,14 +124,16 @@ fn run_loop(
     docs_path: &Path,
     config: &mut AppConfig,
 ) -> Result<()> {
-    let jira = jira::State::new();
+    let (async_sender, async_receiver) = mpsc::channel();
+    let jira = jira::State::new(async_sender.clone());
     let configuration = configuration::State::new(
         config_path()?.display().to_string(),
         store.path().display().to_string(),
         docs_path.display().to_string(),
         config.ui.accent.clone(),
+        async_sender,
     )?;
-    let mut state = State::new(configuration, jira);
+    let mut state = State::new(configuration, jira, async_receiver);
     let carried = store.carry()?;
     if carried > 0 {
         state.message = format!(
@@ -122,12 +144,7 @@ fn run_loop(
 
     loop {
         state.configuration.set_width(terminal.size()?.width);
-        for action in state.jira.poll() {
-            apply_jira_action(action, &mut state, store)?;
-        }
-        if let Some(message) = state.configuration.poll() {
-            state.message = message;
-        }
+        drain_async_events(&mut state, store)?;
         let week_report = state.week.report(store)?;
         let entries = week_report
             .as_ref()
@@ -225,6 +242,24 @@ fn run_loop(
             edit_selected_document(terminal, &entries, &mut state, store, docs_path)?;
         }
     }
+}
+
+fn drain_async_events(state: &mut State, store: &mut Store) -> Result<()> {
+    while let Ok(event) = state.async_receiver.try_recv() {
+        match event {
+            AsyncEvent::Jira(event) => {
+                if let Some(action) = state.jira.apply_event(event) {
+                    apply_jira_action(action, state, store)?;
+                }
+            }
+            AsyncEvent::Configuration(event) => {
+                if let Some(message) = state.configuration.apply_event(event) {
+                    state.message = message;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_task_key(
@@ -673,13 +708,17 @@ mod tests {
 
     #[test]
     fn jira_project_reaches_configuration_without_action_propagation() -> Result<()> {
-        let jira = jira::State::test_with_config(crate::jira::JiraConfig {
-            site: "https://example.atlassian.net".to_owned(),
-            email: "user@example.com".to_owned(),
-            cloud_id: "cloud-id".to_owned(),
-            project: Some("ROOT".to_owned()),
-        });
-        let mut state = State::new(configuration::State::default(), jira);
+        let (sender, receiver) = mpsc::channel();
+        let jira = jira::State::test_with_config(
+            crate::jira::JiraConfig {
+                site: "https://example.atlassian.net".to_owned(),
+                email: "user@example.com".to_owned(),
+                cloud_id: "cloud-id".to_owned(),
+                project: Some("ROOT".to_owned()),
+            },
+            sender.clone(),
+        );
+        let mut state = State::new(configuration::State::test_default(sender), jira, receiver);
         state.mode = Mode::Configuration;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend)?;
@@ -735,6 +774,28 @@ mod tests {
             entry.task.text == "Imported task" && entry.task.jira.as_deref() == Some("APP-10")
         }));
         assert_eq!(state.message, "Imported APP-10");
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_async_events_are_applied_in_channel_order() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        let (mut state, sender) = State::test_default();
+
+        sender.send(AsyncEvent::Configuration(configuration::Event::Result(
+            0,
+            std::time::Instant::now(),
+            Err("configuration event".to_owned()),
+        )))?;
+        sender.send(AsyncEvent::Jira(jira::Event::Transitioned(
+            "APP-1".to_owned(),
+            Err("jira event".to_owned()),
+        )))?;
+
+        drain_async_events(&mut state, &mut store)?;
+
+        assert_eq!(state.message, "jira event");
         Ok(())
     }
 }

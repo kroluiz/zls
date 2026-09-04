@@ -2,7 +2,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::Sender,
     },
     thread,
     time::Duration,
@@ -20,9 +20,12 @@ use ratatui::{
 
 use crate::jira as jira_api;
 
-use super::layout::{centered, centered_fixed};
+use super::{
+    AsyncEvent,
+    layout::{centered, centered_fixed},
+};
 
-enum Event {
+pub(super) enum Event {
     Card(String, Box<Result<jira_api::IssueCard, String>>),
     Search(u64, Result<Vec<jira_api::IssueSummary>, String>),
     Projects(u64, Result<Vec<jira_api::ProjectSummary>, String>),
@@ -77,8 +80,7 @@ pub(super) struct State {
     config: Option<jira_api::JiraConfig>,
     client: Option<jira_api::JiraClient>,
     startup_error: Option<String>,
-    sender: Sender<Event>,
-    receiver: Receiver<Event>,
+    sender: Sender<AsyncEvent>,
     card: Option<jira_api::IssueCard>,
     requested_key: Option<String>,
     card_loading: bool,
@@ -102,13 +104,15 @@ pub(super) struct State {
 }
 
 impl State {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(sender: Sender<AsyncEvent>) -> Self {
         match jira_api::JiraConfig::load() {
             Ok(config) => match jira_api::JiraClient::from_config_snapshot(config.clone()) {
-                Ok(client) => Self::with_client(Some(config), Some(client), None),
-                Err(error) => Self::with_client(Some(config), None, Some(error.to_string())),
+                Ok(client) => Self::with_client(Some(config), Some(client), None, sender),
+                Err(error) => {
+                    Self::with_client(Some(config), None, Some(error.to_string()), sender)
+                }
             },
-            Err(error) => Self::with_client(None, None, Some(error.to_string())),
+            Err(error) => Self::with_client(None, None, Some(error.to_string()), sender),
         }
     }
 
@@ -116,14 +120,13 @@ impl State {
         config: Option<jira_api::JiraConfig>,
         client: Option<jira_api::JiraClient>,
         startup_error: Option<String>,
+        sender: Sender<AsyncEvent>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel();
         Self {
             config,
             client,
             startup_error,
             sender,
-            receiver,
             card: None,
             requested_key: None,
             card_loading: false,
@@ -148,13 +151,16 @@ impl State {
     }
 
     #[cfg(test)]
-    pub(super) fn test_default() -> Self {
-        Self::with_client(None, None, None)
+    pub(super) fn test_default(sender: Sender<AsyncEvent>) -> Self {
+        Self::with_client(None, None, None, sender)
     }
 
     #[cfg(test)]
-    pub(super) fn test_with_config(config: jira_api::JiraConfig) -> Self {
-        Self::with_client(Some(config), None, Some("unavailable".to_owned()))
+    pub(super) fn test_with_config(
+        config: jira_api::JiraConfig,
+        sender: Sender<AsyncEvent>,
+    ) -> Self {
+        Self::with_client(Some(config), None, Some("unavailable".to_owned()), sender)
     }
 
     pub(super) fn client(&self) -> Option<&jira_api::JiraClient> {
@@ -263,7 +269,7 @@ impl State {
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = client.transitions(&key).map_err(|error| error.to_string());
-            let _ = sender.send(Event::Transitions(event_key, result));
+            let _ = sender.send(AsyncEvent::Jira(Event::Transitions(event_key, result)));
         });
         Action::mode(ModeIntent::Transition)
     }
@@ -280,7 +286,7 @@ impl State {
             let result = client
                 .issue_comments(&key, 50)
                 .map_err(|error| error.to_string());
-            let _ = sender.send(Event::MoreComments(event_key, result));
+            let _ = sender.send(AsyncEvent::Jira(Event::MoreComments(event_key, result)));
         });
         Action::notice("Loading more comments...")
     }
@@ -302,7 +308,7 @@ impl State {
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = client.projects().map_err(|error| error.to_string());
-            let _ = sender.send(Event::Projects(generation, result));
+            let _ = sender.send(AsyncEvent::Jira(Event::Projects(generation, result)));
         });
         Action::mode(ModeIntent::Project)
     }
@@ -426,7 +432,7 @@ impl State {
                     let result = client
                         .transition_issue(&key, &transition_id)
                         .map_err(|error| error.to_string());
-                    let _ = sender.send(Event::Transitioned(event_key, result));
+                    let _ = sender.send(AsyncEvent::Jira(Event::Transitioned(event_key, result)));
                 });
                 Action {
                     mode: Some(ModeIntent::Normal),
@@ -482,7 +488,7 @@ impl State {
                     let result = client
                         .post_comment(&key, &text)
                         .map_err(|error| error.to_string());
-                    let _ = sender.send(Event::Comment(event_key, result));
+                    let _ = sender.send(AsyncEvent::Jira(Event::Comment(event_key, result)));
                 });
                 self.comment_input.clear();
                 Action {
@@ -513,7 +519,7 @@ impl State {
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = client.issue_card(&key).map_err(|error| error.to_string());
-            let _ = sender.send(Event::Card(event_key, Box::new(result)));
+            let _ = sender.send(AsyncEvent::Jira(Event::Card(event_key, Box::new(result))));
         });
     }
 
@@ -538,107 +544,101 @@ impl State {
             let result = client
                 .search_issues(&query)
                 .map_err(|error| error.to_string());
-            let _ = sender.send(Event::Search(generation, result));
+            let _ = sender.send(AsyncEvent::Jira(Event::Search(generation, result)));
         });
     }
 
-    pub(super) fn poll(&mut self) -> Vec<Action> {
-        let mut actions = Vec::new();
-        while let Ok(event) = self.receiver.try_recv() {
-            let notice = match event {
-                Event::Card(key, result) if self.requested_key.as_deref() == Some(&key) => {
-                    self.card_loading = false;
-                    match *result {
-                        Ok(card) => {
-                            self.card = Some(card);
-                            None
-                        }
-                        Err(error) => Some(error),
-                    }
-                }
-                Event::Search(generation, result) if generation == self.search_generation => {
-                    self.search_loading = false;
-                    match result {
-                        Ok(issues) => {
-                            self.search_results = issues;
-                            self.search_selected = 0;
-                            None
-                        }
-                        Err(error) => Some(error),
-                    }
-                }
-                Event::Projects(generation, result) if generation == self.project_generation => {
-                    self.project_loading = false;
-                    match result {
-                        Ok(projects) => {
-                            self.project_error = false;
-                            self.project_results = projects;
-                            self.project_selected = self
-                                .config()
-                                .and_then(|config| config.project.as_deref())
-                                .and_then(|selected| {
-                                    self.project_results
-                                        .iter()
-                                        .position(|project| project.key == selected)
-                                })
-                                .unwrap_or(0);
-                            self.project_results.is_empty().then(|| {
-                                "No Jira projects are available for this account".to_owned()
-                            })
-                        }
-                        Err(error) => {
-                            self.project_error = true;
-                            Some(error)
-                        }
-                    }
-                }
-                Event::Transitions(key, result)
-                    if self.card.as_ref().is_some_and(|card| card.key == key) =>
-                {
-                    self.transition_loading = false;
-                    match result {
-                        Ok(transitions) => {
-                            self.transition_results = transitions;
-                            self.transition_selected = 0;
-                            None
-                        }
-                        Err(error) => Some(error),
-                    }
-                }
-                Event::Transitioned(key, result) => match result {
-                    Ok(()) => {
-                        self.refresh();
-                        Some(format!("Updated Jira status for {key}"))
+    pub(super) fn apply_event(&mut self, event: Event) -> Option<Action> {
+        let notice = match event {
+            Event::Card(key, result) if self.requested_key.as_deref() == Some(&key) => {
+                self.card_loading = false;
+                match *result {
+                    Ok(card) => {
+                        self.card = Some(card);
+                        None
                     }
                     Err(error) => Some(error),
-                },
-                Event::Comment(key, result) => match result {
-                    Ok(_) => {
-                        self.refresh();
-                        Some(format!("Comment posted to {key}"))
-                    }
-                    Err(error) => Some(error),
-                },
-                Event::MoreComments(key, result)
-                    if self.card.as_ref().is_some_and(|card| card.key == key) =>
-                {
-                    match result {
-                        Ok(comments) => {
-                            if let Some(card) = self.card.as_mut() {
-                                card.comments = comments;
-                            }
-                            Some("Loaded comment history".to_owned())
-                        }
-                        Err(error) => Some(error),
-                    }
                 }
-                _ => None,
-            };
-            if let Some(notice) = notice {
-                actions.push(Action::notice(notice));
             }
-        }
-        actions
+            Event::Search(generation, result) if generation == self.search_generation => {
+                self.search_loading = false;
+                match result {
+                    Ok(issues) => {
+                        self.search_results = issues;
+                        self.search_selected = 0;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+            Event::Projects(generation, result) if generation == self.project_generation => {
+                self.project_loading = false;
+                match result {
+                    Ok(projects) => {
+                        self.project_error = false;
+                        self.project_results = projects;
+                        self.project_selected = self
+                            .config()
+                            .and_then(|config| config.project.as_deref())
+                            .and_then(|selected| {
+                                self.project_results
+                                    .iter()
+                                    .position(|project| project.key == selected)
+                            })
+                            .unwrap_or(0);
+                        self.project_results
+                            .is_empty()
+                            .then(|| "No Jira projects are available for this account".to_owned())
+                    }
+                    Err(error) => {
+                        self.project_error = true;
+                        Some(error)
+                    }
+                }
+            }
+            Event::Transitions(key, result)
+                if self.card.as_ref().is_some_and(|card| card.key == key) =>
+            {
+                self.transition_loading = false;
+                match result {
+                    Ok(transitions) => {
+                        self.transition_results = transitions;
+                        self.transition_selected = 0;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+            Event::Transitioned(key, result) => match result {
+                Ok(()) => {
+                    self.refresh();
+                    Some(format!("Updated Jira status for {key}"))
+                }
+                Err(error) => Some(error),
+            },
+            Event::Comment(key, result) => match result {
+                Ok(_) => {
+                    self.refresh();
+                    Some(format!("Comment posted to {key}"))
+                }
+                Err(error) => Some(error),
+            },
+            Event::MoreComments(key, result)
+                if self.card.as_ref().is_some_and(|card| card.key == key) =>
+            {
+                match result {
+                    Ok(comments) => {
+                        if let Some(card) = self.card.as_mut() {
+                            card.comments = comments;
+                        }
+                        Some("Loaded comment history".to_owned())
+                    }
+                    Err(error) => Some(error),
+                }
+            }
+            _ => None,
+        };
+        notice.map(Action::notice)
     }
 }
 
@@ -1024,7 +1024,8 @@ mod tests {
     use super::*;
 
     fn state() -> State {
-        State::with_client(None, None, Some("unavailable".to_owned()))
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        State::with_client(None, None, Some("unavailable".to_owned()), sender)
     }
 
     #[test]
@@ -1040,6 +1041,7 @@ mod tests {
             Some(config.clone()),
             None,
             Some("missing Jira token".to_owned()),
+            std::sync::mpsc::channel().0,
         );
 
         assert_eq!(state.config(), Some(&config));
@@ -1063,14 +1065,9 @@ mod tests {
     fn stale_project_responses_are_ignored() {
         let mut state = state();
         state.project_generation = 2;
-        state
-            .sender
-            .send(Event::Projects(1, Err("stale error".to_owned())))
-            .unwrap();
+        let action = state.apply_event(Event::Projects(1, Err("stale error".to_owned())));
 
-        let actions = state.poll();
-
-        assert!(actions.is_empty());
+        assert!(action.is_none());
         assert!(!state.project_error);
     }
 
@@ -1078,17 +1075,12 @@ mod tests {
     fn stale_card_responses_do_not_replace_the_selected_card() {
         let mut state = state();
         state.requested_key = Some("NEW-2".to_owned());
-        state
-            .sender
-            .send(Event::Card(
-                "OLD-1".to_owned(),
-                Box::new(Err("stale card error".to_owned())),
-            ))
-            .unwrap();
+        let action = state.apply_event(Event::Card(
+            "OLD-1".to_owned(),
+            Box::new(Err("stale card error".to_owned())),
+        ));
 
-        let actions = state.poll();
-
-        assert!(actions.is_empty());
+        assert!(action.is_none());
         assert_eq!(state.requested_key.as_deref(), Some("NEW-2"));
     }
 
