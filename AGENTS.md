@@ -128,6 +128,9 @@ Do not weaken or delete a regression test merely to make a refactor compile. Mov
 ## Change Discipline
 
 - Prefer the smallest correct implementation.
+- Every commit must advance the package version in `Cargo.toml` and include the matching generated `Cargo.lock` change. Never reuse a committed version.
+- Start at `0.0.1`. For normal commits, increment the SemVer patch component (`0.0.2`, `0.0.3`, and so on). Increment the minor component for a significant feature milestone and the major component for a breaking milestone.
+- Keep `zls --version` as unpadded SemVer and verify it reports the new package version before committing.
 - Preserve established keybindings and interaction flow unless explicitly asked to change them.
 - Update `README.md` when user-facing commands, configuration, keybindings, or behavior change.
 - Add or update `src/keybindings.rs` for every user-facing binding change.
@@ -146,4 +149,5 @@ A change is complete when:
 4. Regression tests cover the changed behavior and important narrow-layout cases.
 5. Formatting, Clippy, tests, release build, and `git diff --check` pass.
 6. Documentation is current.
-7. If a commit was requested, it contains exactly one coherent change; otherwise the worktree changes are clearly reported.
+7. The package version is advanced exactly once for the change.
+8. If a commit was requested, it contains exactly one coherent change; otherwise the worktree changes are clearly reported.
