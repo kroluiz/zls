@@ -320,7 +320,7 @@ impl JiraClient {
 
     pub fn post_comment(&self, key: &str, text: &str) -> Result<JiraComment> {
         let key = validate_issue_key(key)?;
-        if text.is_empty() {
+        if text.trim().is_empty() {
             bail!("comment must not be empty");
         }
         let payload = comment_payload(text);
@@ -690,18 +690,190 @@ fn validate_project_key(key: &str) -> Result<&str> {
 }
 
 fn comment_payload(text: &str) -> Value {
-    let content = text
-        .split('\n')
-        .map(|line| {
-            let content = if line.is_empty() {
-                Vec::new()
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut content = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim().is_empty() {
+            index += 1;
+            continue;
+        }
+        if let Some(language) = line.strip_prefix("```") {
+            if let Some(relative_end) = lines[index + 1..]
+                .iter()
+                .position(|line| line.trim() == "```")
+            {
+                let end = index + 1 + relative_end;
+                let code = lines[index + 1..end].join("\n");
+                let code_content = if code.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![json!({ "type": "text", "text": code })]
+                };
+                let mut block = json!({ "type": "codeBlock", "content": code_content });
+                if !language.trim().is_empty() {
+                    block["attrs"] = json!({ "language": language.trim() });
+                }
+                content.push(block);
+                index = end + 1;
             } else {
-                vec![json!({ "type": "text", "text": line })]
-            };
-            json!({ "type": "paragraph", "content": content })
-        })
-        .collect::<Vec<_>>();
+                content.push(json!({
+                    "type": "paragraph",
+                    "content": [{ "type": "text", "text": lines[index..].join("\n") }],
+                }));
+                index = lines.len();
+            }
+            continue;
+        }
+        if let Some((level, text)) = markdown_heading(line) {
+            content.push(json!({
+                "type": "heading",
+                "attrs": { "level": level },
+                "content": markdown_inline(text),
+            }));
+            index += 1;
+            continue;
+        }
+        if markdown_bullet(line).is_some() {
+            let mut items = Vec::new();
+            while let Some(text) = lines.get(index).and_then(|line| markdown_bullet(line)) {
+                items.push(json!({
+                    "type": "listItem",
+                    "content": [{ "type": "paragraph", "content": markdown_inline(text) }],
+                }));
+                index += 1;
+            }
+            content.push(json!({ "type": "bulletList", "content": items }));
+            continue;
+        }
+
+        let mut paragraph = Vec::new();
+        while let Some(line) = lines.get(index).filter(|line| {
+            !line.trim().is_empty()
+                && markdown_heading(line).is_none()
+                && markdown_bullet(line).is_none()
+                && !line.starts_with("```")
+        }) {
+            if !paragraph.is_empty() {
+                paragraph.push(json!({ "type": "hardBreak" }));
+            }
+            paragraph.extend(markdown_inline(line));
+            index += 1;
+        }
+        content.push(json!({ "type": "paragraph", "content": paragraph }));
+    }
     json!({ "body": { "type": "doc", "version": 1, "content": content } })
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.bytes().take_while(|byte| *byte == b'#').count();
+    (level > 0 && level <= 6 && line.as_bytes().get(level) == Some(&b' ') && line.len() > level + 1)
+        .then(|| (level, &line[level + 1..]))
+}
+
+fn markdown_bullet(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .filter(|text| !text.is_empty())
+}
+
+fn markdown_inline(mut text: &str) -> Vec<Value> {
+    let mut content = Vec::new();
+    while !text.is_empty() {
+        let marker = text.find(['\\', '`', '[', '!']).unwrap_or(text.len());
+        if marker > 0 {
+            content.push(json!({ "type": "text", "text": &text[..marker] }));
+            text = &text[marker..];
+            continue;
+        }
+
+        if let Some(rest) = text.strip_prefix('\\') {
+            if let Some(character) = rest
+                .chars()
+                .next()
+                .filter(|character| matches!(character, '\\' | '`' | '[' | ']' | '(' | ')' | '*'))
+            {
+                let length = character.len_utf8();
+                content.push(json!({ "type": "text", "text": &rest[..length] }));
+                text = &rest[length..];
+            } else {
+                content.push(json!({ "type": "text", "text": "\\" }));
+                text = rest;
+            }
+            continue;
+        }
+        if text.starts_with("![") {
+            let end = text.find(char::is_whitespace).unwrap_or(text.len()).max(1);
+            content.push(json!({ "type": "text", "text": &text[..end] }));
+            text = &text[end..];
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix('`')
+            && let Some(end) = rest.find('`')
+            && end > 0
+        {
+            content.push(json!({
+                "type": "text",
+                "text": &rest[..end],
+                "marks": [{ "type": "code" }],
+            }));
+            text = &rest[end + 1..];
+            continue;
+        }
+        if let Some((label, url, end)) = markdown_link(text) {
+            content.push(json!({
+                "type": "text",
+                "text": label,
+                "marks": [{ "type": "link", "attrs": { "href": url } }],
+            }));
+            text = &text[end..];
+            continue;
+        }
+        if text.starts_with('[') {
+            let end = text.find(char::is_whitespace).unwrap_or(text.len()).max(1);
+            content.push(json!({ "type": "text", "text": &text[..end] }));
+            text = &text[end..];
+            continue;
+        }
+        let length = text.chars().next().expect("text is not empty").len_utf8();
+        content.push(json!({ "type": "text", "text": &text[..length] }));
+        text = &text[length..];
+    }
+    content
+}
+
+fn markdown_link(text: &str) -> Option<(&str, String, usize)> {
+    let label_end = text.strip_prefix('[')?.find("](")? + 1;
+    let url_start = label_end + 2;
+    if label_end == 1 || url_start >= text.len() {
+        return None;
+    }
+    let mut depth = 0;
+    for (offset, character) in text[url_start..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                let url_end = url_start + offset;
+                let label = &text[1..label_end];
+                let url = &text[url_start..url_end];
+                let url = (!label.contains('\\') && !url.contains('\\'))
+                    .then(|| reqwest::Url::parse(url).ok())
+                    .flatten()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))?;
+                return Some((label, url.into(), url_end + 1));
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn transition_payload(id: &str) -> Value {
@@ -1162,18 +1334,78 @@ mod tests {
     }
 
     #[test]
-    fn multiline_comment_is_adf_paragraphs() {
+    fn markdown_comment_uses_jira_formatting() {
+        let payload = comment_payload(
+            "## Discovery\n\nChecked `service`. See [dashboard](https://example.test).\n\n- First\n- Second",
+        );
+        let blocks = payload["body"]["content"].as_array().unwrap();
+
+        assert_eq!(blocks[0]["type"], "heading");
+        assert_eq!(blocks[0]["attrs"]["level"], 2);
+        assert_eq!(blocks[1]["type"], "paragraph");
+        assert_eq!(blocks[1]["content"][1]["marks"][0]["type"], "code");
+        assert_eq!(blocks[1]["content"][3]["marks"][0]["type"], "link");
+        assert_eq!(blocks[2]["type"], "bulletList");
+        assert_eq!(blocks[2]["content"].as_array().unwrap().len(), 2);
+
+        let code = comment_payload("```sh\necho '[literal](https://example.test)'\n```");
+        assert_eq!(code["body"]["content"][0]["type"], "codeBlock");
+        assert_eq!(code["body"]["content"][0]["attrs"]["language"], "sh");
         assert_eq!(
-            comment_payload("one\n\nthree"),
-            json!({ "body": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    { "type": "paragraph", "content": [{ "type": "text", "text": "one" }] },
-                    { "type": "paragraph", "content": [] },
-                    { "type": "paragraph", "content": [{ "type": "text", "text": "three" }] }
-                ]
-            }})
+            code["body"]["content"][0]["content"][0]["text"],
+            "echo '[literal](https://example.test)'"
+        );
+        assert_eq!(
+            comment_payload("```\n```")["body"]["content"][0]["content"],
+            json!([])
+        );
+        assert_eq!(
+            comment_payload("```\n[still literal](https://example.test)")["body"]["content"][0]["content"]
+                [0]["text"],
+            "```\n[still literal](https://example.test)"
+        );
+        assert_eq!(
+            comment_payload("```\nfirst\n```not closed\nlast\n```")["body"]["content"][0]["content"]
+                [0]["text"],
+            "first\n```not closed\nlast"
+        );
+
+        for malformed in ["****", "**", "``", "[]()"] {
+            let inline = markdown_inline(malformed);
+            assert!(inline.iter().all(|node| node["text"] != ""));
+            assert_eq!(
+                render_adf(&json!({ "type": "paragraph", "content": inline })),
+                malformed
+            );
+        }
+        assert_eq!(
+            render_adf(&json!({
+                "type": "paragraph",
+                "content": markdown_inline(r"\*literal\* [nested](https://example.test/a_(b)) café"),
+            })),
+            "*literal* nested (https://example.test/a_(b)) café"
+        );
+        assert_eq!(
+            render_adf(&json!({
+                "type": "paragraph",
+                "content": markdown_inline("[bad](not a URI) [escaped](https://example.test/a\\(b))"),
+            })),
+            "[bad](not a URI) [escaped](https://example.test/a\\(b))"
+        );
+        assert_eq!(
+            render_adf(&json!({
+                "type": "paragraph",
+                "content": markdown_inline("![alt](https://example.test/image.png)"),
+            })),
+            "![alt](https://example.test/image.png)"
+        );
+
+        assert_eq!(
+            comment_payload("one\n\nthree")["body"]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 

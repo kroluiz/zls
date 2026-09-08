@@ -171,6 +171,8 @@ Jira CLI operations are also available:
 ./target/release/zls jira comment OBS-482 --stdin < jira-comment.md
 ```
 
+Jira comments convert Markdown headings, paragraphs, bullet lists, inline and fenced code, and HTTP(S) links into Jira's native formatting. Unsupported Markdown remains literal text.
+
 Comment text, `--body-file`, and `--stdin` are mutually exclusive. Use `--body-file -` as another way to read the body from stdin.
 
 Issue cards include a structured Details section with creator, reporter, parent, labels, Sprint, issue type, components, fix versions, timestamps, status, priority, assignee, subtasks, issue links, and the five newest comments. Press `t` to open a dropdown containing only the status transitions Jira currently allows for that issue.
