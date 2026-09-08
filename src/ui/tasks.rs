@@ -18,8 +18,6 @@ pub(super) enum Action {
     OpenWeek,
     JiraTogglePane,
     JiraResetScroll,
-    JiraScrollDown,
-    JiraScrollUp,
     EditDocument,
     Notice(String),
 }
@@ -149,8 +147,6 @@ impl State {
                 Action::JiraResetScroll
             }
             KeyCode::Tab => Action::JiraTogglePane,
-            KeyCode::PageDown => Action::JiraScrollDown,
-            KeyCode::PageUp => Action::JiraScrollUp,
             KeyCode::Char('a') => {
                 self.dialog = Dialog::Add;
                 self.input.clear();

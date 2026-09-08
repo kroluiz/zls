@@ -14,7 +14,7 @@ mod week;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -183,6 +183,9 @@ fn run_loop(
         if handle_global_overlay_key(key.code, &mut state) {
             continue;
         }
+        if handle_jira_scroll_key(key.code, key.modifiers, &mut state) {
+            continue;
+        }
 
         match state.mode {
             Mode::Help => {
@@ -298,14 +301,6 @@ fn handle_task_key(
             state.jira.reset_scroll();
             false
         }
-        tasks::Action::JiraScrollDown => {
-            state.jira.scroll_down();
-            false
-        }
-        tasks::Action::JiraScrollUp => {
-            state.jira.scroll_up();
-            false
-        }
         tasks::Action::EditDocument => {
             state.edit_document = true;
             false
@@ -328,8 +323,6 @@ fn apply_week_action(action: week::Action, state: &mut State) -> bool {
         week::Action::JiraFocus => state.jira_tab = true,
         week::Action::JiraToggleFocus => state.jira_tab = !state.jira_tab,
         week::Action::JiraResetScroll => state.jira.reset_scroll(),
-        week::Action::JiraScrollDown => state.jira.scroll_down(),
-        week::Action::JiraScrollUp => state.jira.scroll_up(),
         week::Action::JiraRefresh => state.jira.refresh(),
         week::Action::EditDocument => state.edit_document = true,
     }
@@ -375,6 +368,21 @@ fn handle_global_overlay_key(key: KeyCode, state: &mut State) -> bool {
         }
         _ => false,
     }
+}
+
+fn handle_jira_scroll_key(key: KeyCode, modifiers: KeyModifiers, state: &mut State) -> bool {
+    if state.mode != Mode::Normal
+        || !state.tasks.is_normal()
+        || !modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return false;
+    }
+    match key {
+        KeyCode::Char('n') => state.jira.scroll_down(),
+        KeyCode::Char('p') => state.jira.scroll_up(),
+        _ => return false,
+    }
+    true
 }
 
 fn apply_configuration_action(
@@ -663,7 +671,33 @@ mod tests {
         handle_task_key(KeyCode::Char('a'), &[], &mut state, &mut store)?;
 
         assert!(!handle_global_overlay_key(KeyCode::Char('?'), &mut state));
+        assert!(!handle_jira_scroll_key(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+            &mut state,
+        ));
         Ok(())
+    }
+
+    #[test]
+    fn jira_scroll_uses_control_n_and_p() {
+        let mut state = State::default();
+
+        assert!(handle_jira_scroll_key(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+            &mut state,
+        ));
+        assert!(handle_jira_scroll_key(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+            &mut state,
+        ));
+        assert!(!handle_jira_scroll_key(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+            &mut state,
+        ));
     }
 
     #[test]

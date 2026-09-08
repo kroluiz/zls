@@ -57,7 +57,7 @@ Press `e` to create or edit documentation for the selected task in `$VISUAL`, fa
 
 Press `W` for the weekly retrospective. It groups completed tasks by their completion timestamp across the current ISO week. Use `Left` and `Right` to move through current and previous weeks, `0` to return to the current week, and `Esc` to return to the task list. Tasks remain selectable for Jira inspection and documentation editing.
 
-The Jira card opens on the right for the selected linked task. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Select the Jira project from Configuration (`g`); the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
+The Jira card opens on the right for the selected linked task; scroll it with `Ctrl-N` and `Ctrl-P`. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Select the Jira project from Configuration (`g`); the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.
 
 When the popup opens, unfinished tasks from previous days are automatically carried into today. Completed tasks remain under their original date in history. The operation is idempotent, so reopening the popup does not duplicate or rewrite already-carried tasks.
 

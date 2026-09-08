@@ -52,7 +52,7 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact_label: None,
     },
     Keybinding {
-        keys: "PgUp/PgDn",
+        keys: "Ctrl-N / Ctrl-P",
         description: "scroll the Jira card",
         section: Section::Navigation,
         compact_label: None,
@@ -222,6 +222,11 @@ mod tests {
         );
         assert!(KEYBINDINGS.iter().any(|binding| binding.keys == "?"));
         assert!(!KEYBINDINGS.iter().any(|binding| binding.keys == "s"));
+        assert!(
+            KEYBINDINGS
+                .iter()
+                .any(|binding| binding.keys == "Ctrl-N / Ctrl-P")
+        );
         let hint = compact_hint();
         assert!(hint.contains("? Help"));
         assert!(hint.contains("b Backlog"));

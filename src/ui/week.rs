@@ -22,8 +22,6 @@ pub(super) enum Action {
     JiraFocus,
     JiraToggleFocus,
     JiraResetScroll,
-    JiraScrollDown,
-    JiraScrollUp,
     JiraRefresh,
     EditDocument,
 }
@@ -94,8 +92,6 @@ impl State {
             KeyCode::Char('e') if entry_count > 0 => Action::EditDocument,
             KeyCode::Enter if entry_count > 0 => Action::JiraFocus,
             KeyCode::Tab => Action::JiraToggleFocus,
-            KeyCode::PageDown => Action::JiraScrollDown,
-            KeyCode::PageUp => Action::JiraScrollUp,
             KeyCode::Char('r') => Action::JiraRefresh,
             _ => Action::None,
         }
