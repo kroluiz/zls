@@ -380,8 +380,11 @@ impl Store {
             .position(|section| section.date == BACKLOG)
             .ok_or_else(|| anyhow::anyhow!("backlog is empty"))?;
         let tasks = &self.sections[section_index].tasks;
-        let task_index = if let Ok(number) = reference.parse::<usize>() {
-            (number > 0 && number <= tasks.len()).then_some(number - 1)
+        let task_index = if let Ok(number) = reference.parse::<usize>()
+            && number > 0
+            && number <= tasks.len()
+        {
+            Some(number - 1)
         } else {
             let matches = tasks
                 .iter()
@@ -826,6 +829,27 @@ mod tests {
         store.promote_backlog(&task.id)?;
         assert!(store.entries_backlog().is_empty());
         assert_eq!(store.entries_today()[0].task.text, "future investigation");
+        Ok(())
+    }
+
+    #[test]
+    fn promotes_backlog_tasks_with_numeric_ids() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        store.add_backlog("numeric id")?;
+        store
+            .sections
+            .iter_mut()
+            .find(|section| section.date == BACKLOG)
+            .expect("backlog section exists")
+            .tasks[0]
+            .id = "94129824".to_owned();
+        store.save()?;
+
+        store.promote_backlog("94129824")?;
+
+        assert_eq!(store.entries_today()[0].task.id, "94129824");
+        assert!(store.entries_backlog().is_empty());
         Ok(())
     }
 
