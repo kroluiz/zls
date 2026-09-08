@@ -628,11 +628,31 @@ fn run() -> Result<()> {
                 Ok(())
             }
             JiraAction::Link { task, key } => {
-                println!("{}", serde_json::to_string(&store.link_jira(&task, &key)?)?);
+                let entry = store.entry(&task, true)?;
+                let linked = store.link_jira(&task, &key)?;
+                if let Err(error) = docs::update_jira_link(
+                    &docs_path,
+                    &entry.task,
+                    linked.jira.as_deref(),
+                    jira::JiraConfig::load().ok().as_ref(),
+                ) {
+                    eprintln!("zls: Jira linked, but documentation was not updated: {error:#}");
+                }
+                println!("{}", serde_json::to_string(&linked)?);
                 Ok(())
             }
             JiraAction::Unlink { task } => {
-                println!("{}", serde_json::to_string(&store.unlink_jira(&task)?)?);
+                let entry = store.entry(&task, true)?;
+                let unlinked = store.unlink_jira(&task)?;
+                if let Err(error) = docs::update_jira_link(
+                    &docs_path,
+                    &entry.task,
+                    None,
+                    jira::JiraConfig::load().ok().as_ref(),
+                ) {
+                    eprintln!("zls: Jira unlinked, but documentation was not updated: {error:#}");
+                }
+                println!("{}", serde_json::to_string(&unlinked)?);
                 Ok(())
             }
             JiraAction::Import { key } => {

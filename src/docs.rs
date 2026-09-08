@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use regex::Regex;
 use tempfile::NamedTempFile;
 
 #[cfg(target_os = "linux")]
@@ -117,6 +118,35 @@ pub fn write_document(path: &Path, content: &str, append: bool) -> Result<()> {
         .with_context(|| format!("failed to replace documentation at {}", path.display()))
 }
 
+pub fn update_jira_link(
+    root: &Path,
+    task: &Task,
+    key: Option<&str>,
+    jira: Option<&JiraConfig>,
+) -> Result<bool> {
+    let Some(path) = linked_document_path(root, task)? else {
+        return Ok(false);
+    };
+    let mut content = read_document(root, task)?.expect("linked document was read");
+    let pattern = Regex::new(&format!(
+        r"\A#[^\r\n]*\r?\n\r?\nTask ID: {}\r?\nJira: ([^\r\n]*)\r?\nCreated: \d{{4}}-\d{{2}}-\d{{2}}\r?\n",
+        regex::escape(&task.id)
+    ))?;
+    let range = pattern
+        .captures(&content)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.range())
+        .ok_or_else(|| {
+            anyhow!(
+                "documentation header for task {} was not recognized; left unchanged",
+                task.id
+            )
+        })?;
+    content.replace_range(range, &jira_value(key, jira));
+    write_document(&path, &content, false)?;
+    Ok(true)
+}
+
 fn document_path(root: &Path, link: &str) -> Result<PathBuf> {
     let relative = Path::new(link);
     let mut components = relative.components();
@@ -136,21 +166,24 @@ fn reject_symlink(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn template(entry: &Entry, jira: Option<&JiraConfig>) -> String {
-    let jira_line = entry.task.jira.as_ref().map_or_else(
-        || "Jira: Not linked".to_owned(),
+fn jira_value(key: Option<&str>, jira: Option<&JiraConfig>) -> String {
+    key.map_or_else(
+        || "Not linked".to_owned(),
         |key| {
             jira.map_or_else(
-                || format!("Jira: {key}"),
-                |config| format!("Jira: {}/browse/{key}", config.site.trim_end_matches('/')),
+                || key.to_owned(),
+                |config| format!("{}/browse/{key}", config.site.trim_end_matches('/')),
             )
         },
-    );
+    )
+}
+
+fn template(entry: &Entry, jira: Option<&JiraConfig>) -> String {
     format!(
-        "# {}\n\nTask ID: {}\n{}\nCreated: {}\n\n## Context\n\n## Notes\n\n## Outcome\n",
+        "# {}\n\nTask ID: {}\nJira: {}\nCreated: {}\n\n## Context\n\n## Notes\n\n## Outcome\n",
         entry.task.text,
         entry.task.id,
-        jira_line,
+        jira_value(entry.task.jira.as_deref(), jira),
         today(),
     )
 }
@@ -196,6 +229,48 @@ mod tests {
         write_document(&path, "\naddition\n", true)?;
 
         assert_eq!(fs::read_to_string(path)?, "replacement\naddition\n");
+        Ok(())
+    }
+
+    #[test]
+    fn updates_only_the_generated_jira_header() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let entry = entry();
+        let (path, link) = ensure_document(directory.path(), &entry, None)?;
+        write_document(&path, "\nCustom Jira: keep this\n", true)?;
+
+        assert!(update_jira_link(
+            directory.path(),
+            &Task {
+                doc: Some(link),
+                ..entry.task
+            },
+            Some("MP-999"),
+            None,
+        )?);
+
+        let content = fs::read_to_string(path)?;
+        assert!(content.contains("Jira: MP-999\nCreated:"));
+        assert!(content.ends_with("\nCustom Jira: keep this\n"));
+
+        write_document(
+            &directory.path().join("abc12345.md"),
+            "custom document\n",
+            false,
+        )?;
+        let task = Task {
+            id: "abc12345".to_owned(),
+            text: String::new(),
+            completed: false,
+            done: None,
+            jira: None,
+            doc: Some("abc12345.md".to_owned()),
+        };
+        assert!(update_jira_link(directory.path(), &task, None, None).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("abc12345.md"))?,
+            "custom document\n"
+        );
         Ok(())
     }
 

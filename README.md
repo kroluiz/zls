@@ -106,6 +106,8 @@ Weekly reports always show Monday through Sunday, including days without complet
 
 Each task can own one Markdown document under the configured `[docs] path`. The document is created lazily as `<task-id>.md` and linked explicitly from the task metadata. Interactive edits use `$VISUAL` or `$EDITOR`; automation can replace or append exact non-empty file/stdin content without launching an editor.
 
+Linking, re-linking, or unlinking Jira updates only the generated `Jira:` header in existing task documentation. If that generated header is no longer recognizable, ZLS leaves the document unchanged and reports a warning.
+
 ```console
 ./target/release/zls docs edit 1
 ./target/release/zls docs set TASK_ID --file notes.md

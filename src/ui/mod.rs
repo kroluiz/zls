@@ -1,6 +1,6 @@
 use std::{
     io::{self, stdout},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::Duration,
 };
@@ -64,6 +64,7 @@ struct State {
     edit_document: bool,
     tasks: tasks::State,
     week: week::State,
+    docs_path: PathBuf,
     async_receiver: Receiver<AsyncEvent>,
 }
 
@@ -71,6 +72,7 @@ impl State {
     fn new(
         configuration: configuration::State,
         jira: jira::State,
+        docs_path: PathBuf,
         async_receiver: Receiver<AsyncEvent>,
     ) -> Self {
         Self {
@@ -84,6 +86,7 @@ impl State {
             edit_document: false,
             tasks: tasks::State::default(),
             week: week::State::default(),
+            docs_path,
             async_receiver,
         }
     }
@@ -93,7 +96,10 @@ impl State {
         let (sender, receiver) = mpsc::channel();
         let configuration = configuration::State::test_default(sender.clone());
         let jira = jira::State::test_default(sender.clone());
-        (Self::new(configuration, jira, receiver), sender)
+        (
+            Self::new(configuration, jira, PathBuf::new(), receiver),
+            sender,
+        )
     }
 }
 
@@ -133,7 +139,7 @@ fn run_loop(
         config.ui.accent.clone(),
         async_sender,
     )?;
-    let mut state = State::new(configuration, jira, async_receiver);
+    let mut state = State::new(configuration, jira, docs_path.to_owned(), async_receiver);
     let carried = store.carry()?;
     if carried > 0 {
         state.message = format!(
@@ -403,21 +409,39 @@ fn apply_configuration_action(
 }
 
 fn apply_jira_action(action: jira::Action, state: &mut State, store: &mut Store) -> Result<()> {
+    let mut documentation_error = None;
     if let Some(effect) = action.store {
         match effect {
             jira::StoreEffect::Link { task_id, issue_key } => {
-                store.link_jira(&task_id, &issue_key)?;
+                let entry = store.entry(&task_id, false)?;
+                let linked = store.link_jira(&task_id, &issue_key)?;
+                if let Err(error) = docs::update_jira_link(
+                    &state.docs_path,
+                    &entry.task,
+                    linked.jira.as_deref(),
+                    state.jira.config(),
+                ) {
+                    documentation_error = Some(error);
+                }
             }
             jira::StoreEffect::Import { summary, issue_key } => {
                 store.add_linked(&summary, Some(&issue_key))?;
                 state.tasks.show_today();
             }
             jira::StoreEffect::Unlink { task_id } => {
+                let entry = store.entry(&task_id, false)?;
                 store.unlink_jira(&task_id)?;
+                if let Err(error) =
+                    docs::update_jira_link(&state.docs_path, &entry.task, None, state.jira.config())
+                {
+                    documentation_error = Some(error);
+                }
             }
         }
     }
-    if let Some(message) = action.notice {
+    if let Some(error) = documentation_error {
+        state.message = format!("Jira updated, but documentation was not: {error:#}");
+    } else if let Some(message) = action.notice {
         state.message = message;
     }
     if let Some(mode) = action.mode {
@@ -718,7 +742,12 @@ mod tests {
             },
             sender.clone(),
         );
-        let mut state = State::new(configuration::State::test_default(sender), jira, receiver);
+        let mut state = State::new(
+            configuration::State::test_default(sender),
+            jira,
+            PathBuf::new(),
+            receiver,
+        );
         state.mode = Mode::Configuration;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend)?;
@@ -741,12 +770,18 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let mut store = Store::load(directory.path().join("todo.md"))?;
         let task = store.add("Existing task")?;
-        let mut state = State::default();
+        let mut state = State {
+            docs_path: directory.path().join("docs"),
+            ..State::default()
+        };
+        let entry = store.entry(&task.id, false)?;
+        let (document, link) = docs::ensure_document(&state.docs_path, &entry, None)?;
+        store.link_document(&task.id, &link)?;
         let action = jira::Action {
             mode: Some(jira::ModeIntent::Normal),
             notice: Some("Linked to APP-9".to_owned()),
             store: Some(jira::StoreEffect::Link {
-                task_id: task.id,
+                task_id: task.id.clone(),
                 issue_key: "APP-9".to_owned(),
             }),
         };
@@ -754,8 +789,23 @@ mod tests {
         apply_jira_action(action, &mut state, &mut store)?;
 
         assert_eq!(store.entries_today()[0].task.jira.as_deref(), Some("APP-9"));
+        assert!(std::fs::read_to_string(&document)?.contains("Jira: APP-9\nCreated:"));
         assert_eq!(state.message, "Linked to APP-9");
         assert!(matches!(state.mode, Mode::Normal));
+
+        apply_jira_action(
+            jira::Action {
+                notice: Some("Jira link removed".to_owned()),
+                store: Some(jira::StoreEffect::Unlink {
+                    task_id: task.id.clone(),
+                }),
+                ..jira::Action::default()
+            },
+            &mut state,
+            &mut store,
+        )?;
+        assert_eq!(store.entries_today()[0].task.jira, None);
+        assert!(std::fs::read_to_string(document)?.contains("Jira: Not linked\nCreated:"));
 
         apply_jira_action(
             jira::Action {

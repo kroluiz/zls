@@ -109,6 +109,7 @@ API tokens are secrets:
 - Backlog entries use the reserved `## Backlog` heading when present; empty backlog sections may be omitted.
 - Weekly reports use Monday through Sunday and keep dated entries before undated completions.
 - Task documents are created lazily as `<task-id>.md` and linked from task metadata. Only explicit edits and `docs set/append` rewrite them.
+- Jira link changes update only the generated Jira header identified by the adjacent task ID and creation fields. Unrecognized custom document structures must remain untouched and produce a warning.
 - Reject document paths and symlinks that escape the configured documentation root.
 
 ## Testing Guidance
