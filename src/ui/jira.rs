@@ -48,9 +48,21 @@ pub(super) enum ModeIntent {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StoreEffect {
-    Link { task_id: String, issue_key: String },
-    Import { summary: String, issue_key: String },
-    Unlink { task_id: String },
+    Link {
+        task_id: String,
+        issue_key: String,
+    },
+    Import {
+        summary: String,
+        issue_key: String,
+    },
+    Unlink {
+        task_id: String,
+    },
+    TouchJira {
+        issue_key: String,
+        action: &'static str,
+    },
 }
 
 #[derive(Default)]
@@ -636,14 +648,28 @@ impl State {
             Event::Transitioned(key, result) => match result {
                 Ok(()) => {
                     self.refresh();
-                    Some(format!("Updated Jira status for {key}"))
+                    return Some(Action {
+                        notice: Some(format!("Updated Jira status for {key}")),
+                        store: Some(StoreEffect::TouchJira {
+                            issue_key: key,
+                            action: "jira-transitioned",
+                        }),
+                        ..Action::default()
+                    });
                 }
                 Err(error) => Some(error),
             },
             Event::Comment(key, result) => match result {
                 Ok(_) => {
                     self.refresh();
-                    Some(format!("Comment posted to {key}"))
+                    return Some(Action {
+                        notice: Some(format!("Comment posted to {key}")),
+                        store: Some(StoreEffect::TouchJira {
+                            issue_key: key,
+                            action: "jira-commented",
+                        }),
+                        ..Action::default()
+                    });
                 }
                 Err(error) => Some(error),
             },

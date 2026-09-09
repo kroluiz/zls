@@ -203,6 +203,7 @@ mod tests {
                 done: None,
                 jira: Some("MP-396".to_owned()),
                 doc: None,
+                touches: Vec::new(),
             },
         }
     }
@@ -265,6 +266,7 @@ mod tests {
             done: None,
             jira: None,
             doc: Some("abc12345.md".to_owned()),
+            touches: Vec::new(),
         };
         assert!(update_jira_link(directory.path(), &task, None, None).is_err());
         assert_eq!(

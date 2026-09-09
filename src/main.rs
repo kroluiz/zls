@@ -58,7 +58,7 @@ enum Action {
     Status,
     /// Move a task to today, tomorrow, backlog, or a date
     Move { task: String, destination: String },
-    /// Show completed tasks for an ISO week
+    /// Show task activity for an ISO week
     Week {
         /// Select the current week (0), previous week (1), and so on
         #[arg(long, default_value_t = 0)]
@@ -238,8 +238,8 @@ fn print_week_report(report: &WeekReport, as_json: bool) -> Result<()> {
         report.iso_year, report.iso_week, report.start, report.end
     );
     println!(
-        "{} completed / {} Jira-linked\n",
-        report.completed, report.jira_linked
+        "{} touched tasks / {} touches / {} completed / {} Jira-linked\n",
+        report.touched, report.touches, report.completed, report.jira_linked
     );
     for day in &report.days {
         let title = NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
@@ -247,7 +247,7 @@ fn print_week_report(report: &WeekReport, as_json: bool) -> Result<()> {
             .unwrap_or_else(|_| day.date.clone());
         println!("{title}");
         if day.tasks.is_empty() {
-            println!("  No completed tasks.");
+            println!("  No task activity.");
         }
         for entry in &day.tasks {
             let jira = entry
@@ -260,7 +260,12 @@ fn print_week_report(report: &WeekReport, as_json: bool) -> Result<()> {
             } else {
                 ""
             };
-            println!("  [x] {}{jira}{docs}", entry.task.text);
+            let state = if entry.task.completed { 'x' } else { ' ' };
+            println!(
+                "  [{state}] {}{jira}{docs} / {}",
+                entry.task.text,
+                entry.task.touch_summary()
+            );
         }
         println!();
     }
@@ -277,7 +282,7 @@ fn print_week_report(report: &WeekReport, as_json: bool) -> Result<()> {
             } else {
                 ""
             };
-            println!("  [x] {}{jira}{docs}", entry.task.text);
+            println!("  [x] {}{jira}{docs} / legacy completion", entry.task.text);
         }
     }
     Ok(())
@@ -481,19 +486,25 @@ fn run() -> Result<()> {
             DocsAction::Edit { task } => {
                 let entry = store.entry(&task, true)?;
                 let path = ensure_task_document(&mut store, &entry, &docs_path)?;
-                docs::edit_document(&path)
+                docs::edit_document(&path)?;
+                store.record_touch(&entry.task.id, "docs-edited")?;
+                Ok(())
             }
             DocsAction::Set { task, input } => {
                 let content = read_document_input(input)?;
                 let entry = store.entry(&task, true)?;
                 let path = ensure_task_document(&mut store, &entry, &docs_path)?;
-                docs::write_document(&path, &content, false)
+                docs::write_document(&path, &content, false)?;
+                store.record_touch(&entry.task.id, "docs-set")?;
+                Ok(())
             }
             DocsAction::Append { task, input } => {
                 let content = read_document_input(input)?;
                 let entry = store.entry(&task, true)?;
                 let path = ensure_task_document(&mut store, &entry, &docs_path)?;
-                docs::write_document(&path, &content, true)
+                docs::write_document(&path, &content, true)?;
+                store.record_touch(&entry.task.id, "docs-appended")?;
+                Ok(())
             }
             DocsAction::Show { task } => {
                 let entry = store.entry(&task, true)?;
@@ -610,6 +621,7 @@ fn run() -> Result<()> {
             } => {
                 let text = read_comment_input(text, body_file, stdin)?;
                 let comment = jira::JiraClient::from_config()?.post_comment(&key, &text)?;
+                store.record_jira_touch(&key, "jira-commented")?;
                 println!("{}", serde_json::to_string_pretty(&comment)?);
                 Ok(())
             }
@@ -624,6 +636,7 @@ fn run() -> Result<()> {
             }
             JiraAction::Transition { key, id } => {
                 jira::JiraClient::from_config()?.transition_issue(&key, &id)?;
+                store.record_jira_touch(&key, "jira-transitioned")?;
                 println!("Updated Jira status for {key}");
                 Ok(())
             }

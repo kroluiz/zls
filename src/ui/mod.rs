@@ -445,6 +445,9 @@ fn apply_jira_action(action: jira::Action, state: &mut State, store: &mut Store)
                     documentation_error = Some(error);
                 }
             }
+            jira::StoreEffect::TouchJira { issue_key, action } => {
+                store.record_jira_touch(&issue_key, action)?;
+            }
         }
     }
     if let Some(error) = documentation_error {
@@ -508,7 +511,10 @@ fn edit_selected_document(
     enable_raw_mode()?;
     terminal.clear()?;
     state.message = match edit_result {
-        Ok(()) => format!("Documentation saved for {}", entry.task.id),
+        Ok(()) => {
+            store.record_touch(&entry.task.id, "docs-edited")?;
+            format!("Documentation saved for {}", entry.task.id)
+        }
         Err(error) => format!("Documentation error: {error:#}"),
     };
     Ok(())

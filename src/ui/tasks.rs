@@ -496,6 +496,7 @@ mod tests {
                 done: None,
                 jira: Some("MP-396".to_owned()),
                 doc: None,
+                touches: Vec::new(),
             },
         };
 

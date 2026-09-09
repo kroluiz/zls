@@ -25,6 +25,51 @@ pub struct Task {
     pub jira: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub touches: Vec<Touch>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Touch {
+    pub at: String,
+    pub action: String,
+}
+
+impl Task {
+    pub fn touch_summary(&self) -> String {
+        let times = self
+            .touches
+            .iter()
+            .filter_map(|touch| DateTime::parse_from_rfc3339(&touch.at).ok())
+            .map(|at| at.format("%H:%M").to_string())
+            .collect::<Vec<_>>();
+        let range = match (times.first(), times.last()) {
+            (Some(first), Some(last)) if first != last => format!(" {first}-{last}"),
+            (Some(first), _) => format!(" {first}"),
+            _ => String::new(),
+        };
+        let mut actions = Vec::new();
+        for touch in &self.touches {
+            let action = touch.action.replace('-', " ");
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+        format!(
+            "{} touch{}{} / {}",
+            self.touches.len(),
+            if self.touches.len() == 1 { "" } else { "es" },
+            range,
+            actions.join(", ")
+        )
+    }
+
+    fn touch(&mut self, action: &str) {
+        self.touches.push(Touch {
+            at: Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
+            action: action.to_owned(),
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +97,8 @@ pub struct WeekReport {
     pub iso_week: u32,
     pub start: String,
     pub end: String,
+    pub touched: usize,
+    pub touches: usize,
     pub completed: usize,
     pub jira_linked: usize,
     pub days: Vec<WeekDay>,
@@ -98,6 +145,7 @@ fn new_task(text: &str) -> Task {
         done: None,
         jira: None,
         doc: None,
+        touches: Vec::new(),
     }
 }
 
@@ -173,13 +221,45 @@ impl Store {
                         .and_then(|value| value.strip_prefix(':'))
                 })
             };
+            let completed = captures[1].eq_ignore_ascii_case("x");
+            let done = value("done").map(str::to_owned);
+            let mut touches = metadata
+                .split_whitespace()
+                .filter_map(|field| field.strip_prefix("touch:"))
+                .filter_map(|value| value.split_once('/'))
+                .filter(|(at, action)| {
+                    DateTime::parse_from_rfc3339(at).is_ok() && !action.is_empty()
+                })
+                .map(|(at, action)| Touch {
+                    at: at.to_owned(),
+                    action: action.to_owned(),
+                })
+                .collect::<Vec<_>>();
+            if completed
+                && let Some(at) = done.as_deref()
+                && DateTime::parse_from_rfc3339(at).is_ok()
+                && !touches
+                    .iter()
+                    .any(|touch| touch.at == at && touch.action == "completed")
+            {
+                touches.push(Touch {
+                    at: at.to_owned(),
+                    action: "completed".to_owned(),
+                });
+            }
+            touches.sort_by_key(|touch| {
+                DateTime::parse_from_rfc3339(&touch.at)
+                    .expect("touch timestamps were validated")
+                    .timestamp()
+            });
             self.sections[index].tasks.push(Task {
                 id: value("id").map_or_else(|| new_task(&captures[2]).id, str::to_owned),
                 text: captures[2].to_owned(),
-                completed: captures[1].eq_ignore_ascii_case("x"),
-                done: value("done").map(str::to_owned),
+                completed,
+                done,
                 jira: value("jira").map(str::to_owned),
                 doc: value("doc").map(str::to_owned),
+                touches,
             });
         }
     }
@@ -294,20 +374,23 @@ impl Store {
             .collect::<Vec<_>>();
         let mut undated = Vec::new();
 
-        for entry in self
-            .entries_all()
-            .into_iter()
-            .filter(|entry| entry.task.completed)
-        {
-            let completed_date = entry
-                .task
-                .done
-                .as_deref()
-                .and_then(|done| DateTime::parse_from_rfc3339(done).ok())
-                .map(|done| done.date_naive());
-            if let Some(date) = completed_date.filter(|date| *date >= start && *date <= end) {
-                days[(date - start).num_days() as usize].tasks.push(entry);
-            } else if completed_date.is_none()
+        for entry in self.entries_all() {
+            for (offset, day) in days.iter_mut().enumerate() {
+                let date = start + Duration::days(offset as i64);
+                let mut activity = entry.clone();
+                activity.task.touches.retain(|touch| {
+                    DateTime::parse_from_rfc3339(&touch.at).is_ok_and(|at| at.date_naive() == date)
+                });
+                if !activity.task.touches.is_empty() {
+                    day.tasks.push(activity);
+                }
+            }
+            if entry.task.completed
+                && entry
+                    .task
+                    .done
+                    .as_deref()
+                    .is_none_or(|done| DateTime::parse_from_rfc3339(done).is_err())
                 && NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d")
                     .is_ok_and(|date| date >= start && date <= end)
             {
@@ -319,13 +402,25 @@ impl Store {
             day.tasks.sort_by_key(|entry| {
                 entry
                     .task
-                    .done
-                    .as_deref()
-                    .and_then(|done| DateTime::parse_from_rfc3339(done).ok())
-                    .map(|done| done.timestamp())
+                    .touches
+                    .first()
+                    .and_then(|touch| DateTime::parse_from_rfc3339(&touch.at).ok())
+                    .map(|at| at.timestamp())
             });
         }
-        let completed = days.iter().map(|day| day.tasks.len()).sum::<usize>() + undated.len();
+        let touched = days.iter().map(|day| day.tasks.len()).sum::<usize>();
+        let touches = days
+            .iter()
+            .flat_map(|day| &day.tasks)
+            .map(|entry| entry.task.touches.len())
+            .sum();
+        let completed = days
+            .iter()
+            .flat_map(|day| &day.tasks)
+            .flat_map(|entry| &entry.task.touches)
+            .filter(|touch| touch.action == "completed")
+            .count()
+            + undated.len();
         let jira_linked = days
             .iter()
             .flat_map(|day| &day.tasks)
@@ -337,6 +432,8 @@ impl Store {
             iso_week,
             start: start.to_string(),
             end: end.to_string(),
+            touched,
+            touches,
             completed,
             jira_linked,
             days,
@@ -355,6 +452,7 @@ impl Store {
         }
         let mut task = new_task(&text);
         task.jira = jira.map(normalize_jira_key).transpose()?;
+        task.touch("added");
         let index = self.ensure_today();
         self.sections[index].tasks.push(task.clone());
         self.save()?;
@@ -366,7 +464,8 @@ impl Store {
         if text.is_empty() {
             bail!("task text cannot be empty");
         }
-        let task = new_task(&text);
+        let mut task = new_task(&text);
+        task.touch("added");
         let index = self.ensure_backlog();
         self.sections[index].tasks.push(task.clone());
         self.save()?;
@@ -396,7 +495,8 @@ impl Store {
         }
         .ok_or_else(|| anyhow::anyhow!("backlog task not found or ambiguous: {reference}"))?;
 
-        let task = self.sections[section_index].tasks.remove(task_index);
+        let mut task = self.sections[section_index].tasks.remove(task_index);
+        task.touch("promoted");
         let today_index = self.ensure_today();
         self.sections[today_index].tasks.push(task.clone());
         self.sections.retain(|section| !section.tasks.is_empty());
@@ -416,7 +516,8 @@ impl Store {
             return Ok(self.sections[section_index].tasks[task_index].clone());
         }
 
-        let task = self.sections[section_index].tasks.remove(task_index);
+        let mut task = self.sections[section_index].tasks.remove(task_index);
+        task.touch("moved");
         self.sections.retain(|section| !section.tasks.is_empty());
         let destination_index = self.ensure_section(&destination);
         self.sections[destination_index].tasks.push(task.clone());
@@ -429,6 +530,7 @@ impl Store {
         let (section_index, task_index) = self.find(reference, true)?;
         let task = &mut self.sections[section_index].tasks[task_index];
         task.jira = Some(key);
+        task.touch("jira-linked");
         let result = task.clone();
         self.save()?;
         Ok(result)
@@ -438,6 +540,7 @@ impl Store {
         let (section_index, task_index) = self.find(reference, true)?;
         let task = &mut self.sections[section_index].tasks[task_index];
         task.jira = None;
+        task.touch("jira-unlinked");
         let result = task.clone();
         self.save()?;
         Ok(result)
@@ -459,6 +562,7 @@ impl Store {
         let (section_index, task_index) = self.find(reference, false)?;
         let task = &mut self.sections[section_index].tasks[task_index];
         task.doc = Some(link.to_owned());
+        task.touch("docs-linked");
         let result = task.clone();
         self.save()?;
         Ok(result)
@@ -473,10 +577,43 @@ impl Store {
         let (section_index, task_index) = self.find(reference, today_only_for_number)?;
         let task = &mut self.sections[section_index].tasks[task_index];
         task.completed = completed;
-        task.done = completed.then(|| Local::now().to_rfc3339_opts(SecondsFormat::Secs, false));
+        task.touch(if completed { "completed" } else { "reopened" });
+        task.done = completed.then(|| {
+            task.touches
+                .last()
+                .expect("completion touch exists")
+                .at
+                .clone()
+        });
         let result = task.clone();
         self.save()?;
         Ok(result)
+    }
+
+    pub fn record_touch(&mut self, reference: &str, action: &str) -> Result<Task> {
+        let (section_index, task_index) = self.find(reference, false)?;
+        let task = &mut self.sections[section_index].tasks[task_index];
+        task.touch(action);
+        let result = task.clone();
+        self.save()?;
+        Ok(result)
+    }
+
+    pub fn record_jira_touch(&mut self, key: &str, action: &str) -> Result<usize> {
+        let key = normalize_jira_key(key)?;
+        let mut count = 0;
+        for section in &mut self.sections {
+            for task in &mut section.tasks {
+                if task.jira.as_deref() == Some(&key) {
+                    task.touch(action);
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.save()?;
+        }
+        Ok(count)
     }
 
     fn find(&self, reference: &str, today_only_for_number: bool) -> Result<(usize, usize)> {
@@ -628,8 +765,12 @@ impl Store {
                     .doc
                     .as_ref()
                     .map_or_else(String::new, |path| format!(" doc:{path}"));
+                let touches = task.touches.iter().fold(String::new(), |mut value, touch| {
+                    value.push_str(&format!(" touch:{}/{}", touch.at, touch.action));
+                    value
+                });
                 output.push_str(&format!(
-                    "- [{state}] {} <!-- id:{}{jira}{doc}{done} -->\n",
+                    "- [{state}] {} <!-- id:{}{jira}{doc}{done}{touches} -->\n",
                     task.text, task.id,
                 ));
             }
@@ -689,16 +830,34 @@ mod tests {
     fn add_complete_and_reopen() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("todo.md");
-        let mut store = Store::load(path)?;
+        let mut store = Store::load(path.clone())?;
         let added = store.add("write   the report")?;
         assert_eq!(store.entries_today()[0].task.text, "write the report");
 
         store.set_completed(&added.id, true, true)?;
         assert!(store.entries_all()[0].task.completed);
         assert!(store.entries_all()[0].task.done.is_some());
+        assert_eq!(
+            store.entries_all()[0].task.done,
+            store.entries_all()[0]
+                .task
+                .touches
+                .last()
+                .map(|touch| touch.at.clone())
+        );
 
         store.set_completed(&added.id, false, false)?;
         assert!(!store.entries_today()[0].task.completed);
+        let loaded = Store::load(path)?;
+        assert_eq!(
+            loaded.entries_today()[0]
+                .task
+                .touches
+                .iter()
+                .map(|touch| touch.action.as_str())
+                .collect::<Vec<_>>(),
+            ["added", "completed", "reopened"]
+        );
         Ok(())
     }
 
@@ -788,12 +947,12 @@ mod tests {
     }
 
     #[test]
-    fn weekly_report_groups_by_completion_time_and_keeps_undated_tasks() -> Result<()> {
+    fn weekly_report_groups_all_activity_and_keeps_undated_completions() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("todo.md");
         fs::write(
             &path,
-            "# ZLS Tasks\n\n## 2026-08-20\n\n- [x] finished Tuesday <!-- id:tue jira:MP-1 done:2026-09-01T00:30:00+14:00 -->\n\n## 2026-09-02\n\n- [x] old completion <!-- id:old done:2026-08-20T10:00:00-03:00 -->\n- [x] missing timestamp <!-- id:undated -->\n- [ ] still open <!-- id:open -->\n",
+            "# ZLS Tasks\n\n## 2026-08-20\n\n- [x] finished Tuesday <!-- id:tue jira:MP-1 done:2026-09-01T00:30:00+14:00 -->\n\n## 2026-09-02\n\n- [x] old completion <!-- id:old done:2026-08-20T10:00:00-03:00 -->\n- [x] missing timestamp <!-- id:undated -->\n- [ ] still open <!-- id:open touch:2026-09-02T09:00:00-03:00/added touch:2026-09-02T15:12:00-03:00/docs-appended -->\n",
         )?;
         let store = Store::load(path)?;
 
@@ -801,12 +960,19 @@ mod tests {
 
         assert_eq!(report.start, "2026-08-31");
         assert_eq!(report.end, "2026-09-06");
+        assert_eq!(report.touched, 2);
+        assert_eq!(report.touches, 3);
         assert_eq!(report.completed, 2);
         assert_eq!(report.jira_linked, 1);
         assert_eq!(report.days.len(), 7);
         assert_eq!(report.days[1].tasks[0].task.id, "tue");
+        assert_eq!(report.days[2].tasks[0].task.id, "open");
+        assert_eq!(
+            report.days[2].tasks[0].task.touch_summary(),
+            "2 touches 09:00-15:12 / added, docs appended"
+        );
         assert_eq!(report.undated[0].task.id, "undated");
-        assert_eq!(report.entries().len(), 2);
+        assert_eq!(report.entries().len(), 3);
         assert!(store.week_report_weeks_ago(u32::MAX).is_err());
 
         let year_boundary = store.week_report(2025, 1)?;

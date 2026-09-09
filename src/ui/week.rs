@@ -100,11 +100,13 @@ impl State {
 
 pub(super) fn title(report: &WeekReport) -> String {
     format!(
-        "ZLS / WEEK / {}-W{:02} / {} TO {} / {} DONE / {} JIRA",
+        "ZLS / WEEK / {}-W{:02} / {} TO {} / {} TASKS / {} TOUCHES / {} DONE / {} JIRA",
         report.iso_year,
         report.iso_week,
         report.start,
         report.end,
+        report.touched,
+        report.touches,
         report.completed,
         report.jira_linked,
     )
@@ -130,7 +132,7 @@ pub(super) fn draw(
         )));
         if day.tasks.is_empty() {
             items.push(ListItem::new(Line::styled(
-                "  No completed tasks.",
+                "  No task activity.",
                 Style::default().add_modifier(Modifier::DIM),
             )));
         }
@@ -180,7 +182,16 @@ fn task_item(entry: &Entry) -> ListItem<'static> {
     } else {
         ""
     };
-    ListItem::new(format!("  [x] {}{jira}{docs}", entry.task.text))
+    let state = if entry.task.completed { 'x' } else { ' ' };
+    let activity = if entry.task.touches.is_empty() {
+        "legacy completion".to_owned()
+    } else {
+        entry.task.touch_summary()
+    };
+    ListItem::new(format!(
+        "  [{state}] {}{jira}{docs} / {activity}",
+        entry.task.text
+    ))
 }
 
 #[cfg(test)]
@@ -199,6 +210,7 @@ mod tests {
                 done: None,
                 jira: None,
                 doc: None,
+                touches: Vec::new(),
             },
         }
     }
@@ -210,6 +222,8 @@ mod tests {
             iso_week: 36,
             start: "2026-08-31".to_owned(),
             end: "2026-09-06".to_owned(),
+            touched: 0,
+            touches: 0,
             completed: 2,
             jira_linked: 0,
             days: vec![WeekDay {
@@ -234,7 +248,7 @@ mod tests {
                 });
         assert!(rendered.find("dated task").unwrap() < rendered.find("Undated").unwrap());
         assert!(rendered.find("Undated").unwrap() < rendered.find("undated task").unwrap());
-        assert!(rendered.contains(">   [x] undated task"));
+        assert!(rendered.contains(">   [x] undated task / legacy completion"));
         Ok(())
     }
 

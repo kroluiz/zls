@@ -89,7 +89,7 @@ pub const KEYBINDINGS: &[Keybinding] = &[
     },
     Keybinding {
         keys: "W",
-        description: "open the weekly completion retrospective",
+        description: "open the weekly task activity retrospective",
         section: Section::Tasks,
         compact_label: None,
     },
