@@ -1,4 +1,4 @@
-.PHONY: all build check clean fmt install install-user lint popup run test
+.PHONY: all build check clean fmt install install-user install-skill lint popup run test
 
 PREFIX ?= /usr
 BINDIR ?= $(PREFIX)/bin
@@ -32,6 +32,9 @@ install: build
 
 install-user:
 	cargo install --path .
+
+install-skill:
+	install -Dm644 skills/zls/SKILL.md "$(HOME)/.config/opencode/skills/zls/SKILL.md"
 
 clean:
 	cargo clean

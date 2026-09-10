@@ -6,7 +6,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use regex::Regex;
+use serde::Serialize;
 use tempfile::NamedTempFile;
 
 #[cfg(target_os = "linux")]
@@ -89,6 +91,42 @@ pub fn edit_document(path: &Path) -> Result<()> {
         bail!("editor exited with {status}");
     }
     Ok(())
+}
+
+pub fn document_updated_at(path: &Path) -> Result<String> {
+    reject_symlink(path)?;
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| {
+            format!(
+                "failed to read documentation metadata at {}",
+                path.display()
+            )
+        })?;
+    Ok(DateTime::<Utc>::from(modified).to_rfc3339())
+}
+
+#[derive(Serialize)]
+pub struct WriteAcknowledgement {
+    task_id: String,
+    path: PathBuf,
+    operation: &'static str,
+    document_updated_at: String,
+}
+
+pub fn write_task_document(
+    task_id: &str,
+    path: &Path,
+    content: &str,
+    append: bool,
+) -> Result<WriteAcknowledgement> {
+    write_document(path, content, append)?;
+    Ok(WriteAcknowledgement {
+        task_id: task_id.to_owned(),
+        path: path.to_owned(),
+        operation: if append { "append" } else { "set" },
+        document_updated_at: document_updated_at(path)?,
+    })
 }
 
 pub fn write_document(path: &Path, content: &str, append: bool) -> Result<()> {
@@ -226,8 +264,22 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let (path, _) = ensure_document(directory.path(), &entry(), None)?;
 
-        write_document(&path, "replacement", false)?;
-        write_document(&path, "\naddition\n", true)?;
+        for (append, content, operation) in [
+            (false, "replacement", "set"),
+            (true, "\naddition\n", "append"),
+        ] {
+            let ack = write_task_document("abc12345", &path, content, append)?;
+            assert_eq!(ack.task_id, "abc12345");
+            assert_eq!(ack.path, path);
+            assert_eq!(ack.operation, operation);
+            assert_eq!(
+                DateTime::parse_from_rfc3339(&ack.document_updated_at)?,
+                DateTime::<Utc>::from(fs::metadata(&path)?.modified()?)
+            );
+        }
+        let missing = directory.path().join("missing.md");
+        assert!(write_task_document("missing", &missing, "text", false).is_err());
+        assert!(write_task_document("missing", &missing, "text", true).is_err());
 
         assert_eq!(fs::read_to_string(path)?, "replacement\naddition\n");
         Ok(())
@@ -297,6 +349,10 @@ mod tests {
         assert!(ensure_document(&docs, &entry(), None).is_err());
         assert!(write_document(&docs.join("abc12345.md"), "overwrite", false).is_err());
         assert!(write_document(&docs.join("abc12345.md"), "append", true).is_err());
+        assert!(
+            write_task_document("abc12345", &docs.join("abc12345.md"), "overwrite", false).is_err()
+        );
+        assert!(document_updated_at(&docs.join("abc12345.md")).is_err());
         Ok(())
     }
 }

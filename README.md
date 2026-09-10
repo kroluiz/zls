@@ -119,13 +119,38 @@ printf '## Update\n\nDone.\n' | ./target/release/zls docs append TASK_ID --stdin
 
 To use a non-default task store and file input together, put the task-file option before the subcommand: `zls --file tasks.md docs set TASK_ID --file notes.md`.
 
+Successful `docs set` and `docs append` print a JSON acknowledgement of the persisted file:
+
+```json
+{"task_id":"abc12345","path":"/home/user/.local/share/zls/docs/abc12345.md","operation":"append","document_updated_at":"2026-09-10T14:30:00+00:00"}
+```
+
+`document_updated_at` is the file modification time in UTC RFC 3339, not a content version or a claim that the document is up to date. Failed writes emit no success acknowledgement.
+
 For AI tools, `context` emits JSON containing the local task, its complete documentation, and its Jira correlation. Use `--format markdown` for readable output or `--jira` to fetch current issue details without comments. The default command makes no network requests.
+
+`task.jira` is the single canonical linked issue key (absent for unlinked tasks). The top-level `issue` field is always present and is `null` unless `--jira` fetches the card using that key. This intentionally replaces the former top-level `jira` field in the pre-1.0 JSON schema. Markdown still shows the linked key without fetching a card. `--jira` fails for an unlinked task.
+
+Context also includes `document_updated_at`, using the same persisted file mtime as write acknowledgements; it is `null` when the task has no document.
 
 ```console
 ./target/release/zls context TASK_ID
 ./target/release/zls context TASK_ID --format markdown
 ./target/release/zls context TASK_ID --jira > context.json
 ```
+
+## Agent discovery
+
+```console
+zls agent-guide
+make install-skill
+```
+
+`agent-guide` prints a version-matched JSON contract without reading configuration, tasks, credentials, or the network, so it works before setup. It includes ordered workflow instructions, required Markdown section conventions, and a curated command catalog with examples and effect labels. Use `zls --help` and `zls <command> --help` for authoritative syntax. The guide's schema version is independent of the package version; additive fields may appear within schema version 1.
+
+Agents start with `zls context <task>`, record discovery and decisions in task Markdown, resolve open choices with the user, and stop when required evidence is missing. The guide is component-neutral; ZLS remains a task record rather than an agent runtime.
+
+`make install-skill` installs `skills/zls/SKILL.md` at `~/.config/opencode/skills/zls/SKILL.md`. Re-running it replaces the installed copy. The small activation skill loads the installed CLI contract rather than duplicating it. After installing, quit and restart OpenCode to discover the skill.
 
 ## Jira Cloud
 

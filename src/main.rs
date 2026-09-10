@@ -1,3 +1,4 @@
+mod agent_guide;
 mod config;
 mod docs;
 mod jira;
@@ -7,7 +8,7 @@ mod ui;
 
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
@@ -32,6 +33,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Print the version-matched agent contract as JSON without loading local state
+    AgentGuide,
     /// Open the interactive interface
     Ui,
     /// Open the interface in a tmux popup
@@ -296,7 +299,8 @@ fn shell_quote(value: &str) -> String {
 struct TaskContext {
     task: Entry,
     documentation: Option<String>,
-    jira: Option<jira::IssueCard>,
+    document_updated_at: Option<String>,
+    issue: Option<jira::IssueCard>,
 }
 
 fn ensure_task_document(store: &mut Store, entry: &Entry, docs_path: &Path) -> Result<PathBuf> {
@@ -356,31 +360,36 @@ fn read_document_input(input: DocumentInput) -> Result<String> {
     Ok(content)
 }
 
-fn print_task_context(context: &TaskContext, format: ContextFormat) -> Result<()> {
+fn print_task_context(
+    context: &TaskContext,
+    format: ContextFormat,
+    mut output: impl Write,
+) -> Result<()> {
     match format {
-        ContextFormat::Json => println!("{}", serde_json::to_string_pretty(context)?),
+        ContextFormat::Json => writeln!(output, "{}", serde_json::to_string_pretty(context)?)?,
         ContextFormat::Markdown => {
-            println!("# Task Context\n");
-            println!("- ID: {}", context.task.task.id);
-            println!("- Title: {}", context.task.task.text);
-            println!("- Date: {}", context.task.date);
-            println!("- Completed: {}", context.task.task.completed);
+            writeln!(output, "# Task Context\n")?;
+            writeln!(output, "- ID: {}", context.task.task.id)?;
+            writeln!(output, "- Title: {}", context.task.task.text)?;
+            writeln!(output, "- Date: {}", context.task.date)?;
+            writeln!(output, "- Completed: {}", context.task.task.completed)?;
             if let Some(key) = context.task.task.jira.as_deref() {
-                println!("- Jira: {key}");
+                writeln!(output, "- Jira: {key}")?;
             }
-            println!("\n## Documentation\n");
-            println!(
+            writeln!(output, "\n## Documentation\n")?;
+            writeln!(
+                output,
                 "{}",
                 context
                     .documentation
                     .as_deref()
                     .unwrap_or("Not documented.")
-            );
-            if let Some(issue) = context.jira.as_ref() {
-                println!("\n## Jira Issue\n");
-                println!("```json");
-                println!("{}", serde_json::to_string_pretty(issue)?);
-                println!("```");
+            )?;
+            if let Some(issue) = context.issue.as_ref() {
+                writeln!(output, "\n## Jira Issue\n")?;
+                writeln!(output, "```json")?;
+                writeln!(output, "{}", serde_json::to_string_pretty(issue)?)?;
+                writeln!(output, "```")?;
             }
         }
     }
@@ -389,6 +398,10 @@ fn print_task_context(context: &TaskContext, format: ContextFormat) -> Result<()
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Action::AgentGuide)) {
+        println!("{}", serde_json::to_string_pretty(&agent_guide::guide())?);
+        return Ok(());
+    }
     let mut config = AppConfig::load_or_create(initial_task_file()?)?;
     let docs_path = expand_home(config.docs.path.clone());
     let file = cli
@@ -397,6 +410,7 @@ fn run() -> Result<()> {
         .unwrap_or_else(|| config.tasks.path.clone());
     let mut store = Store::load(expand_home(file))?;
     match cli.command.unwrap_or(Action::Ui) {
+        Action::AgentGuide => unreachable!("agent guide is dispatched before loading state"),
         Action::Ui => ui::run(&mut store, &docs_path, &mut config),
         Action::Popup => {
             if env::var_os("TMUX").is_none() {
@@ -494,16 +508,20 @@ fn run() -> Result<()> {
                 let content = read_document_input(input)?;
                 let entry = store.entry(&task, true)?;
                 let path = ensure_task_document(&mut store, &entry, &docs_path)?;
-                docs::write_document(&path, &content, false)?;
+                let acknowledgement =
+                    docs::write_task_document(&entry.task.id, &path, &content, false)?;
                 store.record_touch(&entry.task.id, "docs-set")?;
+                println!("{}", serde_json::to_string(&acknowledgement)?);
                 Ok(())
             }
             DocsAction::Append { task, input } => {
                 let content = read_document_input(input)?;
                 let entry = store.entry(&task, true)?;
                 let path = ensure_task_document(&mut store, &entry, &docs_path)?;
-                docs::write_document(&path, &content, true)?;
+                let acknowledgement =
+                    docs::write_task_document(&entry.task.id, &path, &content, true)?;
                 store.record_touch(&entry.task.id, "docs-appended")?;
+                println!("{}", serde_json::to_string(&acknowledgement)?);
                 Ok(())
             }
             DocsAction::Show { task } => {
@@ -528,6 +546,9 @@ fn run() -> Result<()> {
         Action::Context { task, format, jira } => {
             let entry = store.entry(&task, true)?;
             let documentation = docs::read_document(&docs_path, &entry.task)?;
+            let document_updated_at = docs::linked_document_path(&docs_path, &entry.task)?
+                .map(|path| docs::document_updated_at(&path))
+                .transpose()?;
             let issue = if jira {
                 let key = entry
                     .task
@@ -542,9 +563,11 @@ fn run() -> Result<()> {
                 &TaskContext {
                     task: entry,
                     documentation,
-                    jira: issue,
+                    document_updated_at,
+                    issue,
                 },
                 format,
+                io::stdout().lock(),
             )
         }
         Action::Backlog { command } => match command {
@@ -695,6 +718,55 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_distinguishes_linked_identity_from_fetched_issue() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("tasks.md"))?;
+        let task = store.add("Investigate")?;
+        for linked in [false, true] {
+            if linked {
+                store.link_jira(&task.id, "MP-467")?;
+            }
+            for fetched in [false, true] {
+                if fetched && !linked {
+                    continue;
+                }
+                let context = TaskContext {
+                    task: store.entry(&task.id, true)?,
+                    documentation: Some("Custom Jira: WRONG-1".to_owned()),
+                    document_updated_at: None,
+                    issue: fetched.then(|| {
+                        serde_json::from_value(serde_json::json!({
+                            "key": "MP-467", "summary": "Fetched summary", "status": "Open",
+                            "description": "", "subtasks": [], "links": [], "comments": []
+                        }))
+                        .unwrap()
+                    }),
+                };
+                let mut json = Vec::new();
+                print_task_context(&context, ContextFormat::Json, &mut json)?;
+                let json: serde_json::Value = serde_json::from_slice(&json)?;
+                assert!(json.get("jira").is_none());
+                assert_eq!(json["task"].get("jira").is_some(), linked);
+                assert_eq!(json["issue"].is_null(), !fetched);
+                if linked {
+                    assert_eq!(json["task"]["jira"], "MP-467");
+                }
+                if fetched {
+                    assert_eq!(json["issue"]["key"], "MP-467");
+                }
+                let mut markdown = Vec::new();
+                print_task_context(&context, ContextFormat::Markdown, &mut markdown)?;
+                let markdown = String::from_utf8(markdown)?;
+                assert_eq!(markdown.contains("- Jira: MP-467"), linked);
+                assert_eq!(markdown.contains("## Jira Issue"), fetched);
+                assert_eq!(markdown.contains("Fetched summary"), fetched);
+                assert!(markdown.contains("Custom Jira: WRONG-1"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn reads_cli_input_from_text_or_file() -> Result<()> {
