@@ -531,37 +531,33 @@ fn draw(frame: &mut Frame, entries: &[Entry], state: &State, week_report: Option
         .split(frame.area());
     draw_header(frame, areas[0], state, week_report);
 
-    if areas[1].width >= 100 {
+    let (content_area, jira_area) = if areas[1].width >= 100 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(areas[1]);
-        if let Some(report) = week_report {
-            week::draw(
-                frame,
-                panes[0],
-                report,
-                state.week.selected(),
-                state.configuration.accent(),
-            );
-        } else {
-            state.tasks.draw(frame, panes[0], entries);
-        }
-        jira::draw_card(frame, panes[1], &state.jira, state.configuration.accent());
+        (Some(panes[0]), Some(panes[1]))
     } else if state.jira_tab {
-        jira::draw_card(frame, areas[1], &state.jira, state.configuration.accent());
+        (None, Some(areas[1]))
     } else {
+        (Some(areas[1]), None)
+    };
+
+    if let Some(area) = content_area {
         if let Some(report) = week_report {
             week::draw(
                 frame,
-                areas[1],
+                area,
                 report,
                 state.week.selected(),
                 state.configuration.accent(),
             );
         } else {
-            state.tasks.draw(frame, areas[1], entries);
+            state.tasks.draw(frame, area, entries);
         }
+    }
+    if let Some(area) = jira_area {
+        jira::draw_card(frame, area, &state.jira, state.configuration.accent());
     }
 
     frame.render_widget(
@@ -612,6 +608,50 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn rendered(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn base_panes_render_once_for_wide_and_narrow_layouts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        store.add("layout task")?;
+        let entries = store.entries_today();
+        let report = store.week_report_weeks_ago(0)?;
+        let mut state = State::default();
+
+        let mut wide = Terminal::new(TestBackend::new(120, 24))?;
+        wide.draw(|frame| draw(frame, &entries, &state, None))?;
+        let output = rendered(&wide);
+        assert!(output.contains("layout task"));
+        assert!(output.contains("No Jira project selected"));
+
+        wide.draw(|frame| draw(frame, &entries, &state, Some(&report)))?;
+        let output = rendered(&wide);
+        assert!(output.contains("WEEKLY"));
+        assert!(output.contains("No Jira project selected"));
+
+        let mut narrow = Terminal::new(TestBackend::new(60, 16))?;
+        narrow.draw(|frame| draw(frame, &entries, &state, None))?;
+        let output = rendered(&narrow);
+        assert!(output.contains("layout task"));
+        assert!(!output.contains("No Jira project selected"));
+
+        state.jira_tab = true;
+        narrow.draw(|frame| draw(frame, &entries, &state, None))?;
+        let output = rendered(&narrow);
+        assert!(!output.contains("layout task"));
+        assert!(output.contains("No Jira project selected"));
+        Ok(())
+    }
 
     #[test]
     fn configuration_opens_and_closes_without_leaving_week_view() -> Result<()> {

@@ -300,17 +300,20 @@ impl Store {
     }
 
     pub fn entries_today(&self) -> Vec<Entry> {
-        let current = today();
+        self.entries_for_section(&today())
+    }
+
+    fn entries_for_section(&self, label: &str) -> Vec<Entry> {
         self.sections
             .iter()
-            .find(|section| section.date == current)
+            .find(|section| section.date == label)
             .map(|section| {
                 section
                     .tasks
                     .iter()
                     .cloned()
                     .map(|task| Entry {
-                        date: current.clone(),
+                        date: label.to_owned(),
                         task,
                     })
                     .collect()
@@ -331,21 +334,7 @@ impl Store {
     }
 
     pub fn entries_backlog(&self) -> Vec<Entry> {
-        self.sections
-            .iter()
-            .find(|section| section.date == BACKLOG)
-            .map(|section| {
-                section
-                    .tasks
-                    .iter()
-                    .cloned()
-                    .map(|task| Entry {
-                        date: BACKLOG.to_owned(),
-                        task,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.entries_for_section(BACKLOG)
     }
 
     pub fn week_report_weeks_ago(&self, weeks_ago: u32) -> Result<WeekReport> {
@@ -825,6 +814,26 @@ fn normalize_jira_key(key: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_entries_use_only_the_first_matching_heading() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("todo.md");
+        fs::write(
+            &path,
+            format!(
+                "# ZLS Tasks\n\n## {}\n\n- [ ] first today <!-- id:today-1 -->\n\n## {}\n\n- [ ] second today <!-- id:today-2 -->\n\n## Backlog\n\n- [ ] first backlog <!-- id:backlog-1 -->\n\n## Backlog\n\n- [ ] second backlog <!-- id:backlog-2 -->\n",
+                today(),
+                today()
+            ),
+        )?;
+        let store = Store::load(path)?;
+
+        assert_eq!(store.entries_today()[0].task.id, "today-1");
+        assert_eq!(store.entries_backlog()[0].task.id, "backlog-1");
+        assert_eq!(store.entries_all().len(), 4);
+        Ok(())
+    }
 
     #[test]
     fn add_complete_and_reopen() -> Result<()> {

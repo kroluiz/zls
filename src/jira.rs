@@ -12,7 +12,7 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::config_path;
+use crate::config::{config_path, xdg_path};
 
 const TOKEN_ENV: &str = "ZLS_JIRA_TOKEN";
 const KEYRING_SERVICE: &str = "zls";
@@ -24,14 +24,6 @@ pub struct JiraConfig {
     pub cloud_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JiraUser {
-    pub account_id: String,
-    pub display_name: String,
-    pub email_address: Option<String>,
-    pub avatar_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,7 +205,7 @@ impl JiraClient {
         &self.config
     }
 
-    pub fn current_user(&self) -> Result<JiraUser> {
+    pub fn test_auth(&self) -> Result<String> {
         let response: ApiUser = self
             .authenticated(self.http.get(self.api_url("/rest/api/3/myself")))
             .send()
@@ -222,11 +214,7 @@ impl JiraClient {
             .context("Jira authentication failed")?
             .json()
             .context("invalid current-user response from Jira")?;
-        Ok(response.into())
-    }
-
-    pub fn test_auth(&self) -> Result<JiraUser> {
-        self.current_user()
+        Ok(response.display_name)
     }
 
     pub fn search_issues(&self, query: &str) -> Result<Vec<IssueSummary>> {
@@ -268,14 +256,7 @@ impl JiraClient {
             .context("Jira project search failed")?
             .json()
             .context("invalid Jira project-search response")?;
-        Ok(response
-            .values
-            .into_iter()
-            .map(|project| ProjectSummary {
-                key: project.key,
-                name: project.name,
-            })
-            .collect())
+        Ok(response.values)
     }
 
     pub fn set_project(&mut self, key: &str) -> Result<()> {
@@ -536,15 +517,6 @@ pub fn format_jira_datetime(input: &str) -> String {
 
 pub fn cache_dir() -> Result<PathBuf> {
     xdg_path("XDG_CACHE_HOME", ".cache").map(|path| path.join("zls/jira"))
-}
-
-fn xdg_path(variable: &str, home_suffix: &str) -> Result<PathBuf> {
-    if let Some(path) = env::var_os(variable).filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(home_suffix))
-        .ok_or_else(|| anyhow!("neither {variable} nor HOME is set"))
 }
 
 fn normalize_site(site: &str) -> Result<String> {
@@ -985,26 +957,7 @@ struct TenantInfo {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiUser {
-    account_id: String,
     display_name: String,
-    email_address: Option<String>,
-    avatar_urls: Option<std::collections::HashMap<String, String>>,
-}
-
-impl From<ApiUser> for JiraUser {
-    fn from(user: ApiUser) -> Self {
-        let avatar_url = user.avatar_urls.and_then(|urls| {
-            urls.get("48x48")
-                .cloned()
-                .or_else(|| urls.into_values().next())
-        });
-        Self {
-            account_id: user.account_id,
-            display_name: user.display_name,
-            email_address: user.email_address,
-            avatar_url,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -1016,13 +969,7 @@ struct SearchResponse {
 #[derive(Deserialize)]
 struct ProjectSearchResponse {
     #[serde(default)]
-    values: Vec<ApiProject>,
-}
-
-#[derive(Deserialize)]
-struct ApiProject {
-    key: String,
-    name: String,
+    values: Vec<ProjectSummary>,
 }
 
 #[derive(Deserialize)]
@@ -1254,6 +1201,33 @@ impl ApiTransition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserializes_only_used_user_and_project_fields() -> Result<()> {
+        let user: ApiUser = serde_json::from_value(json!({
+            "accountId": "ignored",
+            "displayName": "Ada Lovelace",
+            "emailAddress": "ignored@example.test"
+        }))?;
+        assert_eq!(user.display_name, "Ada Lovelace");
+
+        let projects: ProjectSearchResponse = serde_json::from_value(json!({
+            "values": [{ "key": "OBS", "name": "Observability", "id": "ignored" }]
+        }))?;
+        assert_eq!(
+            projects.values,
+            vec![ProjectSummary {
+                key: "OBS".to_owned(),
+                name: "Observability".to_owned(),
+            }]
+        );
+        assert!(
+            serde_json::from_value::<ProjectSearchResponse>(json!({}))?
+                .values
+                .is_empty()
+        );
+        Ok(())
+    }
 
     #[test]
     fn renders_common_adf_nodes() {

@@ -568,14 +568,12 @@ fn run() -> Result<()> {
         Action::Jira { command } => match command {
             JiraAction::Auth => {
                 let client = jira::interactive_auth_setup()?;
-                let user = client.test_auth()?;
-                println!("Authenticated as {}", user.display_name);
+                println!("Authenticated as {}", client.test_auth()?);
                 Ok(())
             }
             JiraAction::Test => {
                 let client = jira::JiraClient::from_config()?;
-                let user = client.test_auth()?;
-                println!("Authenticated as {}", user.display_name);
+                println!("Authenticated as {}", client.test_auth()?);
                 Ok(())
             }
             JiraAction::Search { query, json } => {

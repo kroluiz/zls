@@ -311,16 +311,10 @@ impl State {
             KeyCode::Enter => {
                 let accent = self.custom_accent.to_ascii_uppercase();
                 match accent_color(&accent) {
-                    Ok(color) => {
-                        config.set_accent(&accent)?;
-                        self.accent = color;
-                        self.accent_hex = accent.clone();
-                        self.accent_original = accent;
-                        self.accent_selected = ACCENT_PRESETS
-                            .iter()
-                            .position(|preset| preset.hex == self.accent_hex);
+                    Ok(_) => {
+                        let action = self.save_accent(config, &accent)?;
                         self.custom_accent.clear();
-                        Action::AccentSaved(format!("Accent saved as {}", self.accent_hex))
+                        action
                     }
                     Err(error) => Action::Message(error.to_string()),
                 }
@@ -397,10 +391,7 @@ impl State {
         let client = client.clone();
         let sender = self.connection_sender.clone();
         thread::spawn(move || {
-            let result = client
-                .test_auth()
-                .map(|user| user.display_name)
-                .map_err(|error| error.to_string());
+            let result = client.test_auth().map_err(|error| error.to_string());
             let _ = sender.send(AsyncEvent::Configuration(Event::Result(
                 generation,
                 Instant::now(),
@@ -425,37 +416,6 @@ pub(super) fn draw_overview(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = vec![
-        section_separator("ZLS", inner.width),
-        selectable_detail_line(
-            "Config file",
-            &state.config_path,
-            state.selected == 0,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Tasks file",
-            &state.task_path,
-            state.selected == 1,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Docs path",
-            &state.docs_path,
-            state.selected == 2,
-            state.accent,
-        ),
-        Line::raw(""),
-        section_separator("APPEARANCE", inner.width),
-        selectable_detail_line(
-            "Accent",
-            &state.accent_hex,
-            state.selected == CONFIG_ACCENT,
-            state.accent,
-        ),
-        Line::raw(""),
-        section_separator("JIRA", inner.width),
-    ];
     let connection = match &state.connection_status {
         JiraConnectionStatus::NotChecked if jira_error.is_some() || config.is_none() => {
             "Unavailable".to_owned()
@@ -465,51 +425,69 @@ pub(super) fn draw_overview(
         JiraConnectionStatus::Connected(display_name) => format!("Connected as {display_name}"),
         JiraConnectionStatus::Failed(_) => "Failed - Enter to retry".to_owned(),
     };
-    lines.extend([
-        selectable_detail_line(
-            "Project",
-            config
-                .and_then(|config| config.project.as_deref())
-                .unwrap_or("Not selected"),
-            state.selected == CONFIG_PROJECT,
-            state.accent,
+    let mut lines = Vec::new();
+    for (section, details) in [
+        (
+            "ZLS",
+            [
+                (0, "Config file", state.config_path.as_str()),
+                (1, "Tasks file", state.task_path.as_str()),
+                (2, "Docs path", state.docs_path.as_str()),
+            ]
+            .as_slice(),
         ),
-        selectable_detail_line(
-            "Site",
-            config.map_or("Not configured", |config| config.site.as_str()),
-            state.selected == 5,
-            state.accent,
+        (
+            "APPEARANCE",
+            [(CONFIG_ACCENT, "Accent", state.accent_hex.as_str())].as_slice(),
         ),
-        selectable_detail_line(
-            "Email",
-            config.map_or("Not configured", |config| config.email.as_str()),
-            state.selected == 6,
-            state.accent,
+        (
+            "JIRA",
+            [
+                (
+                    CONFIG_PROJECT,
+                    "Project",
+                    config
+                        .and_then(|config| config.project.as_deref())
+                        .unwrap_or("Not selected"),
+                ),
+                (
+                    5,
+                    "Site",
+                    config.map_or("Not configured", |config| config.site.as_str()),
+                ),
+                (
+                    6,
+                    "Email",
+                    config.map_or("Not configured", |config| config.email.as_str()),
+                ),
+                (
+                    7,
+                    "Cloud ID",
+                    config.map_or("Not configured", |config| config.cloud_id.as_str()),
+                ),
+                (
+                    8,
+                    "Credentials",
+                    if jira_error.is_none() {
+                        "Available"
+                    } else {
+                        "Unavailable"
+                    },
+                ),
+                (9, "API token", "Hidden"),
+                (CONFIG_TEST_JIRA, "Status", connection.as_str()),
+            ]
+            .as_slice(),
         ),
-        selectable_detail_line(
-            "Cloud ID",
-            config.map_or("Not configured", |config| config.cloud_id.as_str()),
-            state.selected == 7,
-            state.accent,
-        ),
-        selectable_detail_line(
-            "Credentials",
-            if jira_error.is_none() {
-                "Available"
-            } else {
-                "Unavailable"
-            },
-            state.selected == 8,
-            state.accent,
-        ),
-        selectable_detail_line("API token", "Hidden", state.selected == 9, state.accent),
-        selectable_detail_line(
-            "Status",
-            &connection,
-            state.selected == CONFIG_TEST_JIRA,
-            state.accent,
-        ),
-    ]);
+    ] {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(section_separator(section, inner.width));
+        lines.extend(details.iter().map(|&(index, label, value)| {
+            selectable_detail_line(label, value, state.selected == index, state.accent)
+        }));
+    }
     let mut connection_error_lines = 0;
     if let JiraConnectionStatus::Failed(error) = &state.connection_status {
         let wrapped = wrap_fixed_width(&format!("Error: {error}"), usize::from(inner.width.max(1)));
@@ -654,18 +632,12 @@ fn section_separator(title: &str, width: u16) -> Line<'static> {
 }
 
 fn wrap_fixed_width(value: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for character in value.chars() {
-        if line.chars().count() == width {
-            lines.push(std::mem::take(&mut line));
-        }
-        line.push(character);
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
+    value
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -710,6 +682,12 @@ mod tests {
                     .all(|other| other.hex != preset.hex)
             );
         }
+    }
+
+    #[test]
+    fn fixed_width_wrapping_preserves_unicode_characters() {
+        assert_eq!(wrap_fixed_width("abçdé", 2), ["ab", "çd", "é"]);
+        assert!(wrap_fixed_width("", 2).is_empty());
     }
 
     #[test]
@@ -763,6 +741,57 @@ mod tests {
         assert_eq!(state.selected, CONFIG_LAST_WITH_JIRA);
         state.handle_overview(KeyCode::Up, None, None);
         assert_eq!(state.selected, CONFIG_LAST_WITH_JIRA - 1);
+    }
+
+    #[test]
+    fn overview_keeps_each_selected_row_visible_at_normal_and_narrow_sizes() -> Result<()> {
+        let config = JiraConfig {
+            site: "https://example.atlassian.net".to_owned(),
+            email: "user@example.test".to_owned(),
+            cloud_id: "cloud-id".to_owned(),
+            project: Some("OBS".to_owned()),
+        };
+        let labels = [
+            "Config file",
+            "Tasks file",
+            "Docs path",
+            "Accent",
+            "Project",
+            "Site",
+            "Email",
+            "Cloud ID",
+            "Credentials",
+            "API token",
+            "Status",
+        ];
+        for (width, height) in [(120, 30), (60, 16)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
+            for config in [None, Some(&config)] {
+                let mut state = state();
+                for (index, label) in labels.iter().enumerate() {
+                    state.selected = index;
+                    terminal.draw(|frame| draw_overview(frame, &state, config, None))?;
+                    let rendered = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(
+                        rendered.contains(&format!("> {label}")),
+                        "{width}x{height}: {label}"
+                    );
+                    if width == 120 {
+                        let positions = labels.map(|label| rendered.find(label).unwrap());
+                        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+                        assert!(rendered.contains("Hidden"));
+                        assert!(rendered.contains(config.map_or("Not selected", |_| "OBS")));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

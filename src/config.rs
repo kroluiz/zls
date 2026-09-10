@@ -207,7 +207,7 @@ pub fn default_docs_path() -> Result<PathBuf> {
     xdg_path("XDG_DATA_HOME", ".local/share").map(|path| path.join("zls/docs"))
 }
 
-fn xdg_path(variable: &str, home_suffix: &str) -> Result<PathBuf> {
+pub(crate) fn xdg_path(variable: &str, home_suffix: &str) -> Result<PathBuf> {
     if let Some(path) = env::var_os(variable).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
