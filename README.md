@@ -55,6 +55,8 @@ Press `/` to filter visible tasks in real time by text, Jira key, date, or task 
 
 Press `e` to create or edit documentation for the selected task in `$VISUAL`, falling back to `$EDITOR`. ZLS temporarily leaves the TUI while the editor is open, then restores it. Documented tasks display a `[doc]` marker.
 
+Press `y` to copy the selected task's stable ID for `zls context <task>` or an agent prompt. This works in the normal and weekly views through the terminal's OSC 52 clipboard support; tmux must allow clipboard integration.
+
 Press `W` for the weekly activity retrospective. It groups tasks by every write ZLS made during the current ISO week, showing each task once per day with its touch count, first-to-last touch time, and action summary. Creation, moves, completion changes, Jira links/comments/transitions, and document writes count; automatic carry-over and read-only views do not. Use `Left` and `Right` to move through current and previous weeks, `0` to return to the current week, and `Esc` to return to the task list. Tasks remain selectable for Jira inspection and documentation editing.
 
 The Jira card opens on the right for the selected linked task; scroll it with `Ctrl-N` and `Ctrl-P`. On narrow terminals, ZLS switches to full-width Tasks and Jira tabs. Select the Jira project from Configuration (`g`); the selection is saved in the Jira configuration and all subsequent searches are restricted to it. In the Jira search picker, `Enter` links the highlighted issue and `i` imports it as a new local task. Comments are multiline; use `Ctrl-S` to review, then confirm before posting.

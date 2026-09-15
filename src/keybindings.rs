@@ -76,6 +76,12 @@ pub const KEYBINDINGS: &[Keybinding] = &[
         compact_label: Some("Docs"),
     },
     Keybinding {
+        keys: "y",
+        description: "copy the selected task ID for agent context",
+        section: Section::Tasks,
+        compact_label: Some("Copy ID"),
+    },
+    Keybinding {
         keys: "Space / d",
         description: "complete or reopen the selected task",
         section: Section::Tasks,
@@ -232,6 +238,7 @@ mod tests {
         assert!(hint.contains("b Backlog"));
         assert!(hint.contains("M Move"));
         assert!(hint.contains("l Jira"));
+        assert!(hint.contains("y Copy ID"));
         assert!(!hint.contains("? show"));
         for section in [
             Section::Tasks,

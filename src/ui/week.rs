@@ -12,7 +12,7 @@ use ratatui::{
 use crate::store::{Entry, Store, WeekReport};
 
 pub(super) const HINT: &str =
-    "j/k select  Left/Right week  0 current  e docs  Enter Jira  W/Esc close  q quit";
+    "j/k select  Left/Right week  0 current  e docs  y copy ID  Enter Jira  W/Esc close  q quit";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Action {

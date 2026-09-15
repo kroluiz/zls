@@ -2165,9 +2165,10 @@ dependencies = [
 
 [[package]]
 name = "zls"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "crossterm",

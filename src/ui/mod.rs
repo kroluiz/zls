@@ -13,6 +13,7 @@ mod tasks;
 mod week;
 
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -184,6 +185,9 @@ fn run_loop(
             continue;
         }
         if handle_jira_scroll_key(key.code, key.modifiers, &mut state) {
+            continue;
+        }
+        if handle_copy_key(key.code, &entries, &mut state, terminal.backend_mut())? {
             continue;
         }
 
@@ -383,6 +387,30 @@ fn handle_jira_scroll_key(key: KeyCode, modifiers: KeyModifiers, state: &mut Sta
         _ => return false,
     }
     true
+}
+
+fn handle_copy_key(
+    key: KeyCode,
+    entries: &[Entry],
+    state: &mut State,
+    output: &mut impl io::Write,
+) -> Result<bool> {
+    if key != KeyCode::Char('y') || state.mode != Mode::Normal || !state.tasks.is_normal() {
+        return Ok(false);
+    }
+    let selected = if state.week.is_active() {
+        state.week.selected()
+    } else {
+        state.tasks.selected()
+    };
+    let Some(entry) = entries.get(selected) else {
+        state.message = "Select a task to copy".to_owned();
+        return Ok(true);
+    };
+    write!(output, "\x1b]52;c;{}\x07", STANDARD.encode(&entry.task.id))?;
+    output.flush()?;
+    state.message = format!("Copied task ID {}", entry.task.id);
+    Ok(true)
 }
 
 fn apply_configuration_action(
@@ -744,6 +772,62 @@ mod tests {
             KeyModifiers::NONE,
             &mut state,
         ));
+    }
+
+    #[test]
+    fn copies_selected_task_id_in_task_and_week_views() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        let first = store.add("first")?;
+        let second = store.add("second")?;
+        let entries = store.entries_today();
+        let mut state = State::default();
+        let mut output = Vec::new();
+
+        assert!(handle_copy_key(
+            KeyCode::Char('y'),
+            &entries,
+            &mut state,
+            &mut output,
+        )?);
+        assert_eq!(
+            output,
+            format!("\x1b]52;c;{}\x07", STANDARD.encode(&first.id)).as_bytes()
+        );
+        assert_eq!(state.message, format!("Copied task ID {}", first.id));
+
+        state.week.open();
+        state.week.handle_key(KeyCode::Down, entries.len());
+        output.clear();
+        assert!(handle_copy_key(
+            KeyCode::Char('y'),
+            &entries,
+            &mut state,
+            &mut output,
+        )?);
+        assert_eq!(
+            output,
+            format!("\x1b]52;c;{}\x07", STANDARD.encode(&second.id)).as_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_key_does_not_capture_task_input() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::load(directory.path().join("todo.md"))?;
+        let mut state = State::default();
+        handle_task_key(KeyCode::Char('a'), &[], &mut state, &mut store)?;
+        let mut output = Vec::new();
+
+        assert!(!handle_copy_key(
+            KeyCode::Char('y'),
+            &[],
+            &mut state,
+            &mut output,
+        )?);
+        assert!(output.is_empty());
+        Ok(())
     }
 
     #[test]
