@@ -35,6 +35,7 @@ install-user:
 
 install-skill:
 	install -Dm644 skills/zls/SKILL.md "$(HOME)/.config/opencode/skills/zls/SKILL.md"
+	install -Dm644 skills/zls/SKILL.md "$(HOME)/.claude/skills/zls/SKILL.md"
 
 clean:
 	cargo clean

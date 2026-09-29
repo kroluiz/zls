@@ -129,10 +129,13 @@ fn document_writes_acknowledge_persisted_content_and_context() {
 #[test]
 fn skill_installation_is_repeatable() {
     let directory = tempfile::tempdir().unwrap();
-    let destination = directory
-        .path()
-        .join(".config/opencode/skills/zls/SKILL.md");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/zls/SKILL.md");
+    let destinations = [
+        directory
+            .path()
+            .join(".config/opencode/skills/zls/SKILL.md"),
+        directory.path().join(".claude/skills/zls/SKILL.md"),
+    ];
     for _ in 0..2 {
         let output = Command::new("make")
             .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -145,7 +148,9 @@ fn skill_installation_is_repeatable() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(fs::read(&destination).unwrap(), fs::read(&source).unwrap());
-        fs::write(&destination, "old installed copy").unwrap();
+        for destination in &destinations {
+            assert_eq!(fs::read(destination).unwrap(), fs::read(&source).unwrap());
+            fs::write(destination, "old installed copy").unwrap();
+        }
     }
 }

@@ -152,7 +152,7 @@ make install-skill
 
 Agents start with `zls context <task>`, record discovery and decisions in task Markdown, resolve open choices with the user, and stop when required evidence is missing. The guide is component-neutral; ZLS remains a task record rather than an agent runtime.
 
-`make install-skill` installs `skills/zls/SKILL.md` at `~/.config/opencode/skills/zls/SKILL.md`. Re-running it replaces the installed copy. The small activation skill loads the installed CLI contract rather than duplicating it. After installing, quit and restart OpenCode to discover the skill.
+`make install-skill` installs `skills/zls/SKILL.md` at `~/.config/opencode/skills/zls/SKILL.md` and `~/.claude/skills/zls/SKILL.md`. Re-running it replaces both copies. The small activation skill loads the installed CLI contract rather than duplicating it. Quit and restart OpenCode to discover it. Claude Code picks up an existing `~/.claude/skills` directory live; restart only if that directory was created during the session.
 
 ## Jira Cloud
 
