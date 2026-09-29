@@ -1,6 +1,8 @@
 use std::{
-    io::{self, stdout},
+    env,
+    io::{self, Write, stdout},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
     time::Duration,
 };
@@ -187,7 +189,8 @@ fn run_loop(
         if handle_jira_scroll_key(key.code, key.modifiers, &mut state) {
             continue;
         }
-        if handle_copy_key(key.code, &entries, &mut state, terminal.backend_mut())? {
+        let tmux = env::var_os("TMUX").is_some().then(|| Path::new("tmux"));
+        if handle_copy_key(key.code, &entries, &mut state, terminal.backend_mut(), tmux) {
             continue;
         }
 
@@ -393,10 +396,11 @@ fn handle_copy_key(
     key: KeyCode,
     entries: &[Entry],
     state: &mut State,
-    output: &mut impl io::Write,
-) -> Result<bool> {
+    output: &mut impl Write,
+    tmux: Option<&Path>,
+) -> bool {
     if key != KeyCode::Char('y') || state.mode != Mode::Normal || !state.tasks.is_normal() {
-        return Ok(false);
+        return false;
     }
     let selected = if state.week.is_active() {
         state.week.selected()
@@ -405,12 +409,37 @@ fn handle_copy_key(
     };
     let Some(entry) = entries.get(selected) else {
         state.message = "Select a task to copy".to_owned();
-        return Ok(true);
+        return true;
     };
-    write!(output, "\x1b]52;c;{}\x07", STANDARD.encode(&entry.task.id))?;
+    state.message = match copy_to_clipboard(&entry.task.id, tmux, output) {
+        Ok(()) => format!("Copied task ID {}", entry.task.id),
+        Err(error) => format!("Could not copy task ID: {error:#}"),
+    };
+    true
+}
+
+fn copy_to_clipboard(text: &str, tmux: Option<&Path>, output: &mut impl Write) -> Result<()> {
+    if let Some(tmux) = tmux {
+        let mut child = Command::new(tmux)
+            .args(["load-buffer", "-w", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .expect("tmux stdin was piped")
+            .write_all(text.as_bytes())?;
+        let status = child.wait()?;
+        if !status.success() {
+            anyhow::bail!("tmux clipboard command exited with {status}");
+        }
+        return Ok(());
+    }
+    write!(output, "\x1b]52;c;{}\x07", STANDARD.encode(text))?;
     output.flush()?;
-    state.message = format!("Copied task ID {}", entry.task.id);
-    Ok(true)
+    Ok(())
 }
 
 fn apply_configuration_action(
@@ -636,6 +665,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &State, week_report: Option
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::fs;
 
     fn rendered(terminal: &Terminal<TestBackend>) -> String {
         terminal
@@ -789,7 +819,8 @@ mod tests {
             &entries,
             &mut state,
             &mut output,
-        )?);
+            None,
+        ));
         assert_eq!(
             output,
             format!("\x1b]52;c;{}\x07", STANDARD.encode(&first.id)).as_bytes()
@@ -804,7 +835,8 @@ mod tests {
             &entries,
             &mut state,
             &mut output,
-        )?);
+            None,
+        ));
         assert_eq!(
             output,
             format!("\x1b]52;c;{}\x07", STANDARD.encode(&second.id)).as_bytes()
@@ -825,8 +857,35 @@ mod tests {
             &[],
             &mut state,
             &mut output,
-        )?);
+            None,
+        ));
         assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_copy_uses_load_buffer_with_raw_task_id() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let command = directory.path().join("tmux");
+        let arguments = directory.path().join("arguments");
+        let input = directory.path().join("input");
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n",
+                arguments.display(),
+                input.display()
+            ),
+        )?;
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700))?;
+
+        copy_to_clipboard("abc12345", Some(&command), &mut Vec::new())?;
+
+        assert_eq!(fs::read_to_string(arguments)?, "load-buffer\n-w\n-\n");
+        assert_eq!(fs::read_to_string(input)?, "abc12345");
         Ok(())
     }
 
